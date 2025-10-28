@@ -1,5 +1,5 @@
-# scripts/cloud_collect.py - v0.3
-# Мінімальний реальний збір 5 JSON з фолбеками, штрафами conf і логами.
+# scripts/cloud_collect.py - v0.3.1
+# Мінімальний реальний збір 5 JSON з фолбеками, штрафами conf і логами + index.json.
 # Публічні ендпоїнти, без ключів. Працює в GitHub Actions та локально.
 
 import os, json, time, math, re
@@ -13,7 +13,7 @@ LOG_DIR = os.getenv("LOG_DIR", "log")
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) GitHubActions/FA v0.3"}
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) GitHubActions/FA v0.3.1"}
 
 S = {"flags": [], "missing": [], "notes": []}
 CONF = 1.00  # базова впевненість
@@ -263,13 +263,33 @@ def main():
         "ts": utcnow()
     }
 
+    # write main files
     w("spot_ohlcv_v2.json", spot)
     w("derivs_signals_v2.json", derivs)
     w("options_vola_v2.json", vola)
     w("macro_flows_v2.json", macro)
     w("tripack_meta_v2.json", tripack)
+
+    # log file
     with open(os.path.join(LOG_DIR, "cloud.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(S["notes"]))
+
+    # lightweight index.json для швидкого перегляду у data-cloud
+    index = {
+        "ts": tripack["ts"],
+        "conf": tripack["conf"],
+        "quorum": tripack["log"]["quorum"],
+        "files": [
+            "spot_ohlcv_v2.json",
+            "derivs_signals_v2.json",
+            "options_vola_v2.json",
+            "macro_flows_v2.json",
+            "tripack_meta_v2.json"
+        ],
+        "flags": S["flags"],
+        "missing": S["missing"]
+    }
+    w("index.json", index)
 
 if __name__ == "__main__":
     main()
