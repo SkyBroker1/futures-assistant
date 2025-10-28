@@ -78,7 +78,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # Публікація «живих» JSON у гілку data-cloud, поза .gitignore
+      # Публікація «живих» JSON у гілку data-cloud (public/out/<run_id>/)
       - name: Publish JSON to data-cloud branch
         if: always()
         env:
@@ -88,22 +88,27 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
 
-          # збережемо out/ тимчасово
-          mkdir -p .tmp_publish && cp -r out .tmp_publish/
+          # 1) Зберігаємо JSON у безпечне місце поза робочим деревом git
+          SAFE_DIR="${RUNNER_TEMP}/out_publish"
+          mkdir -p "$SAFE_DIR"
+          cp -r out/*.json "$SAFE_DIR"/ 2>/dev/null || true
 
-          # створимо або переключимось на data-cloud без історії main
+          # 2) Перемикаємось/створюємо гілку data-cloud
           git fetch origin
           if git ls-remote --exit-code --heads origin data-cloud; then
             git checkout -B data-cloud origin/data-cloud
           else
             git checkout --orphan data-cloud
-            rm -rf .* * || true
-            git commit --allow-empty -m "init data-cloud"
+            rm -rf * .[^.]* || true
+            echo "# data-cloud" > README.md
+            git add README.md
+            git commit -m "init data-cloud"
+            git push -u origin data-cloud
           fi
 
-          # кладемо JSON у public/out/<run_id>/ та форсуємо додавання попри .gitignore
+          # 3) Повертаємо JSON і комітимо в public/out/<run_id>/
           mkdir -p "public/out/${RUN_ID}"
-          cp -r ../.tmp_publish/out/* "public/out/${RUN_ID}/" 2>/dev/null || true
+          cp -r "$SAFE_DIR"/* "public/out/${RUN_ID}/" 2>/dev/null || true
           git add -f "public/out/${RUN_ID}"/* 2>/dev/null || true
           git commit -m "publish out for run ${RUN_ID}" || echo "nothing to commit"
-          git push -u origin data-cloud
+          git push origin data-cloud
