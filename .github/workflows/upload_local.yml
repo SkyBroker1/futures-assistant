@@ -1,0 +1,16 @@
+name: Upload local data
+on:
+  push:
+    branches: [ data-local ]
+    paths: [ "incoming/local/**" ]
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: out_local
+          path: incoming/local/**
+          if-no-files-found: error
+          retention-days: 7
