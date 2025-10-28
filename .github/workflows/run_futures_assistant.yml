@@ -1,11 +1,12 @@
-permissions:
-  contents: write
 name: Futures Assistant - cloud
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"  # запуск кожні 30 хв
+    - cron: "*/30 * * * *"  # кожні 30 хв
+
+permissions:
+  contents: write  # потрібно для коміту JSON у гілку data-cloud
 
 concurrency:
   group: cloud-${{ github.ref }}
@@ -67,9 +68,16 @@ jobs:
           name: out_cloud
           path: out/*.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
 
-      - name: Upload cloud artifacts - logs      
+      - name: Upload cloud artifacts - logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs_cloud
+          path: log/**
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Publish JSON to data-cloud branch
         if: always()
         env:
@@ -78,19 +86,20 @@ jobs:
           set -e
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
-          # створимо/оновимо гілку data-cloud у окремому робочому дереві
+
+          # підготуємо тимчасову копію з out/*
           mkdir -p .tmp_publish && cp -r out .tmp_publish/
+
+          # створюємо/оновлюємо гілку data-cloud локально
           git fetch origin
-          git checkout -B data-cloud origin/data-cloud || git checkout -B data-cloud
+          if git ls-remote --exit-code --heads origin data-cloud; then
+            git checkout -B data-cloud origin/data-cloud
+          else
+            git checkout -B data-cloud
+          fi
+
           mkdir -p "out/${RUN_ID}"
-          cp -r .tmp_publish/out/* "out/${RUN_ID}/"
-          git add "out/${RUN_ID}"/*
+          cp -r .tmp_publish/out/* "out/${RUN_ID}/" || true
+          git add "out/${RUN_ID}"/* || true
           git commit -m "publish out for run ${RUN_ID}" || echo "nothing to commit"
           git push origin data-cloud
-
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs_cloud
-          path: log/**
-          if-no-files-found: warn
-          retention-days: 7
