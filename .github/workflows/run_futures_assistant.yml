@@ -1,3 +1,5 @@
+permissions:
+  contents: write
 name: Futures Assistant - cloud
 
 on:
@@ -67,7 +69,25 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload cloud artifacts - logs
+      - name: Upload cloud artifacts - logs      
+      - name: Publish JSON to data-cloud branch
+        if: always()
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -e
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          # створимо/оновимо гілку data-cloud у окремому робочому дереві
+          mkdir -p .tmp_publish && cp -r out .tmp_publish/
+          git fetch origin
+          git checkout -B data-cloud origin/data-cloud || git checkout -B data-cloud
+          mkdir -p "out/${RUN_ID}"
+          cp -r .tmp_publish/out/* "out/${RUN_ID}/"
+          git add "out/${RUN_ID}"/*
+          git commit -m "publish out for run ${RUN_ID}" || echo "nothing to commit"
+          git push origin data-cloud
+
         uses: actions/upload-artifact@v4
         with:
           name: logs_cloud
