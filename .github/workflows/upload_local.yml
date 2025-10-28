@@ -1,7 +1,9 @@
 name: Upload local data
+
 on:
   push:
     branches: [ data-local ]
+
 jobs:
   pack:
     runs-on: ubuntu-latest
@@ -12,4 +14,4 @@ jobs:
           name: out_local
           path: incoming/local/**
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
