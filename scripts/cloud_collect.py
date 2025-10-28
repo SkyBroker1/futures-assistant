@@ -33,7 +33,6 @@ def http_json(url: str, params: Dict[str, Any] = None, timeout: int = 25):
         try:
             r = requests.get(url, params=params, headers=UA, timeout=timeout)
             r.raise_for_status()
-            # дехто повертає текст - пробуємо як JSON, інакше повернемо текст
             try:
                 return r.json()
             except Exception:
@@ -56,11 +55,9 @@ def btc_close_usd() -> float:
 
 # ---------- 2) Stablecoins total + Δ7d ----------
 def stables_total_and_delta7d() -> Tuple[float, float]:
-    # primary: DeFiLlama
     try:
         js = http_json("https://stablecoins.llama.fi/stablecoins")
         total = 0.0
-        # у відповіді список у ключі peggedUSD; беремо market_cap або latest circulating
         for it in js.get("peggedUSD", []):
             mc = it.get("market_cap")
             if mc is None:
@@ -68,12 +65,11 @@ def stables_total_and_delta7d() -> Tuple[float, float]:
                 mc = c.get("latest")
             if mc:
                 total += float(mc)
-        delta7 = 0.0  # спростимо для v0.3
+        delta7 = 0.0
         if total < 220_000_000_000:
             S["flags"].append("stables_suspicious_total<220B")
         return float(total), float(delta7)
     except Exception as e:
-        # fallback: CoinGecko топ-стейбли
         try:
             ids = "tether,usd-coin,dai,first-digital-usd"
             cg = http_json("https://api.coingecko.com/api/v3/simple/price",
@@ -91,11 +87,9 @@ def stables_total_and_delta7d() -> Tuple[float, float]:
 # ---------- 3) ETF flows (Farside -> SoSoValue DOM-fallback) ----------
 def etf_daily_rows() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    # primary: Farside (HTML)
     try:
         html = http_json("https://farside.co.uk/bitcoin-etf-flow")
         if isinstance(html, str):
-            # шукаємо останню дату у форматі YYYY-MM-DD
             m_dates = re.findall(r"(20\d{2}-\d{2}-\d{2})", html)
             if m_dates:
                 rows.append({"date": m_dates[-1], "source": "farside", "note": "dom-fallback"})
@@ -104,12 +98,10 @@ def etf_daily_rows() -> List[Dict[str, Any]]:
         else:
             raise RuntimeError("farside non-html")
     except Exception as e:
-        # fallback: SoSoValue (HTML)
         S["flags"].append("etf_fallback_sosovalue")
         try:
             html2 = http_json("https://sosovalue.com/leaderboard/bitcoin_etf_us")
             if isinstance(html2, str):
-                # беремо поточну дату, щоб пройти strict quorum з позначкою fallback
                 rows.append({"date": datetime.utcnow().date().isoformat(), "source": "sosovalue", "note": "dom-fallback"})
             else:
                 raise RuntimeError("sosovalue non-html")
@@ -118,7 +110,7 @@ def etf_daily_rows() -> List[Dict[str, Any]]:
             log(f"ETF flows failed: farside:{e}; sosovalue:{e2}")
     return rows
 
-# ---------- 4) Options vola - HV surrogate як fallback DVOL ----------
+# ---------- 4) Options vola - HV surrogate ----------
 def btc_hv_30d() -> float:
     try:
         js = http_json("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
@@ -140,7 +132,7 @@ def build_options_vola() -> Dict[str, Any]:
     ok = True
     src = "hv_surrogate"
     S["flags"].append("vol=hv_surrogate")
-    CONF -= 0.10  # штраф за HV-сурогат
+    CONF -= 0.10
     return {
         "ok": ok,
         "dvol": {"BTC": None, "ETH": None},
@@ -185,7 +177,7 @@ def build_derivs_signals() -> Dict[str, Any]:
     for sym in ["BTCUSDT", "ETHUSDT"]:
         rec = binance_premium_index(sym)
         if rec is None:
-            rec = bybit_basis_funding(sym)  # фолбек
+            rec = bybit_basis_funding(sym)
         if rec:
             rec["basis_abs"] = rec["markPrice"] - rec["indexPrice"]
             rec["basis_bps"] = (rec["basis_abs"] / rec["indexPrice"]) * 10_000 if rec["indexPrice"] else None
@@ -236,20 +228,17 @@ def build_macro_flows() -> Dict[str, Any]:
 # ---------- main ----------
 def main():
     global CONF
-    # sanity BTC
     btc = btc_close_usd()
     sanity_ok = (not math.isnan(btc)) and (btc > 1000.0)
     if not sanity_ok:
         S["missing"].append("sanity_btc_close>1000")
         CONF -= 0.05
 
-    # collect
     spot = build_spot_ohlcv()
     derivs = build_derivs_signals()
     vola = build_options_vola()
     macro = build_macro_flows()
 
-    # конф-штрафи
     if any(r.get("source") == "sosovalue" for r in macro.get("etf", {}).get("rows", [])):
         CONF -= 0.05
         S["flags"].append("etf_fallback_sosovalue:-0.05")
@@ -274,7 +263,6 @@ def main():
         "ts": utcnow()
     }
 
-    # write all
     w("spot_ohlcv_v2.json", spot)
     w("derivs_signals_v2.json", derivs)
     w("options_vola_v2.json", vola)
