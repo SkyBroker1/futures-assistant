@@ -38,17 +38,11 @@ jobs:
           OUT_DIR=out
           LOG_DIR=log
           EOF
-
+          
       - name: Run cloud collector
         run: |
           mkdir -p out log
-          # Заглушки щоб усе вже зараз відпрацювало
-          echo '{"ok":true,"note":"cloud run"}' > out/spot_ohlcv_v2.json
-          echo '{"ok":true,"note":"cloud run"}' > out/derivs_signals_v2.json
-          echo '{"ok":true,"note":"cloud run"}' > out/options_vola_v2.json
-          echo '{"ok":true,"note":"cloud run"}' > out/macro_flows_v2.json
-          echo '{"ok":true,"note":"cloud run"}' > out/tripack_meta_v2.json
-          echo "cloud log ok" > log/cloud.txt
+          python scripts/cloud_collect.py
 
       - name: Upload cloud artifacts - out
         uses: actions/upload-artifact@v4
