@@ -2,7 +2,6 @@ name: Upload local data
 on:
   push:
     branches: [ data-local ]
-    paths: [ "incoming/local/**" ]
 jobs:
   pack:
     runs-on: ubuntu-latest
