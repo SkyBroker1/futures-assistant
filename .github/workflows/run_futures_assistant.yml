@@ -78,6 +78,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # Публікація «живих» JSON у гілку data-cloud, поза .gitignore
       - name: Publish JSON to data-cloud branch
         if: always()
         env:
@@ -87,19 +88,22 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
 
-          # підготуємо тимчасову копію з out/*
+          # збережемо out/ тимчасово
           mkdir -p .tmp_publish && cp -r out .tmp_publish/
 
-          # створюємо/оновлюємо гілку data-cloud локально
+          # створимо або переключимось на data-cloud без історії main
           git fetch origin
           if git ls-remote --exit-code --heads origin data-cloud; then
             git checkout -B data-cloud origin/data-cloud
           else
-            git checkout -B data-cloud
+            git checkout --orphan data-cloud
+            rm -rf .* * || true
+            git commit --allow-empty -m "init data-cloud"
           fi
 
-          mkdir -p "out/${RUN_ID}"
-          cp -r .tmp_publish/out/* "out/${RUN_ID}/" || true
-          git add "out/${RUN_ID}"/* || true
+          # кладемо JSON у public/out/<run_id>/ та форсуємо додавання попри .gitignore
+          mkdir -p "public/out/${RUN_ID}"
+          cp -r ../.tmp_publish/out/* "public/out/${RUN_ID}/" 2>/dev/null || true
+          git add -f "public/out/${RUN_ID}"/* 2>/dev/null || true
           git commit -m "publish out for run ${RUN_ID}" || echo "nothing to commit"
-          git push origin data-cloud
+          git push -u origin data-cloud
