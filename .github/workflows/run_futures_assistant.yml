@@ -1,88 +1,91 @@
-diff --git a/.github/workflows/run_futures_assistant.yml b/.github/workflows/run_futures_assistant.yml
-index e6c22d0..1f77aa1 100644
---- a/.github/workflows/run_futures_assistant.yml
-+++ b/.github/workflows/run_futures_assistant.yml
-@@ -1,12 +1,12 @@
- name: Futures Assistant - cloud
- 
- on:
--  workflow_dispatch:
--  schedule:
--    - cron: "*/30 * * * *" # кожні 30 хв
-+  workflow_dispatch:
- 
- permissions:
-   contents: write # потрібно для коміту JSON у гілку data-cloud
- 
- concurrency:
-   group: cloud-${{ github.ref }}
-   cancel-in-progress: true
-@@ -19,7 +19,9 @@ jobs:
- 
-   steps:
-   - name: Checkout
--    uses: actions/checkout@v4
-+    uses: actions/checkout@v4
-+    with:
-+      fetch-depth: 0
- 
-   - name: Setup Python
-     uses: actions/setup-python@v5
-@@ -47,6 +49,8 @@ jobs:
-   - name: Run cloud collector
-     env:
-       OUT_DIR: out
-       LOG_DIR: log
-     run: |
-       mkdir -p out log
-       python scripts/cloud_collect.py
-+
-+  - name: Echo health to logs
-+    run: |
-+      echo "== HEALTH INDEX ==" >> log/cloud.txt || true
-+      if [ -f out/index.json ]; then head -c 4000 out/index.json >> log/cloud.txt; echo "" >> log/cloud.txt; fi
-+      if [ -f out/tripack_meta_v2.json ]; then head -c 6000 out/tripack_meta_v2.json >> log/cloud.txt; echo "" >> log/cloud.txt; fi
-@@ -56,7 +60,7 @@ jobs:
-     with:
-       name: out_cloud
-       path: out/*.json
--      if-no-files-found: error
-+      if-no-files-found: error
- 
-   - name: Upload cloud artifacts - logs
-     uses: actions/upload-artifact@v4
-@@ -67,9 +71,14 @@ jobs:
-   # Публікація «живих» JSON у гілку data-cloud (public/out/<run_id>/)
-   - name: Publish JSON to data-cloud branch
-     if: always()
-     env:
-       RUN_ID: ${{ github.run_id }}
-     run: |
-       set -e
-+      git config --global --add safe.directory "$GITHUB_WORKSPACE"
-       git config user.name "github-actions"
-       git config user.email "actions@users.noreply.github.com"
- 
-       # 1) Зберігаємо JSON у безпечне місце поза робочим деревом git
-       SAFE_DIR="${RUNNER_TEMP}/out_publish"
-       mkdir -p "$SAFE_DIR"
-       cp -r out/*.json "$SAFE_DIR"/ 2>/dev/null || true
-@@ -79,6 +88,7 @@ jobs:
-       git fetch origin
-       if git ls-remote --exit-code --heads origin data-cloud; then
-         git checkout -B data-cloud origin/data-cloud
-       else
-         git checkout --orphan data-cloud
-         rm -rf * .[^.]* || true
-         echo "# data-cloud" > README.md
-         git add README.md
-         git commit -m "init data-cloud"
-         git push -u origin data-cloud
-       fi
-       # 3) Повертаємо JSON і комітимо в public/out/${RUN_ID}/
-       mkdir -p "public/out/${RUN_ID}"
-       cp -r "$SAFE_DIR"/* "public/out/${RUN_ID}/" 2>/dev/null || true
-       git add -f "public/out/${RUN_ID}"/* 2>/dev/null || true
--      git commit -m "publish out for run ${RUN_ID}" || echo "nothing to commit"
-+      git commit -m "publish out for run ${RUN_ID}" || echo "nothing to commit"
-       git push origin data-cloud
+name: Futures Assistant - cloud
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cloud-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cloud:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install deps
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run cloud collector
+      env:
+        OUT_DIR: out
+        LOG_DIR: log
+      run: |
+        mkdir -p out log
+        python scripts/cloud_collect.py
+
+    - name: Echo health to logs
+      run: |
+        echo "== HEALTH INDEX ==" >> log/cloud.txt || true
+        if [ -f out/index.json ]; then head -c 4000 out/index.json >> log/cloud.txt; echo "" >> log/cloud.txt; fi
+        if [ -f out/tripack_meta_v2.json ]; then head -c 6000 out/tripack_meta_v2.json >> log/cloud.txt; echo "" >> log/cloud.txt; fi
+
+    - name: Upload cloud artifacts - out
+      uses: actions/upload-artifact@v4
+      with:
+        name: out_cloud
+        path: out/*.json
+        if-no-files-found: error
+
+    - name: Upload cloud artifacts - logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: logs_cloud
+        path: log/*.txt
+        if-no-files-found: warn
+
+    - name: Publish JSON to data-cloud branch
+      if: always()
+      env:
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        set -e
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        git config user.name "github-actions"
+        git config user.email "actions@users.noreply.github.com"
+
+        SAFE_DIR="${RUNNER_TEMP}/out_publish"
+        mkdir -p "$SAFE_DIR"
+        cp -r out/*.json "$SAFE_DIR"/ 2>/dev/null || true
+
+        git fetch origin
+        if git ls-remote --exit-code --heads origin data-cloud; then
+          git checkout -B data-cloud origin/data-cloud
+        else
+          git checkout --orphan data-cloud
+          rm -rf * .[^.]* || true
+          echo "# data-cloud" > README.md
+          git add README.md
+          git commit -m "init data-cloud"
+          git push -u origin data-cloud
+        fi
+
+        mkdir -p "public/out/${RUN_ID}"
+        cp -r "$SAFE_DIR"/* "public/out/${RUN_ID}/" 2>/dev/null || true
+        git add -f "public/out/${RUN_ID}"/* 2>/dev/null || true
+        git commit -m "publish out for run ${RUN_ID}" || echo "nothing to commit"
+        git push origin data-cloud
