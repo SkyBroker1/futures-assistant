@@ -14,16 +14,32 @@ jobs:
   cloud:
     runs-on: ubuntu-latest
 
-    steps:
+        steps:
     - name: Checkout
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
+    # sanity - ловимо випадкові diff-артефакти в коді/requirements
+    - name: Sanity check sources
+      run: |
+        set -e
+        # cloud_collect.py не повинен містити diff-маркери
+        if grep -qE '^(diff --git|@@|\+{3}|\-{3})' scripts/cloud_collect.py; then
+          echo "cloud_collect.py містить diff-маркери. Встав чистий Python, не patch." >&2
+          exit 1
+        fi
+        # requirements.txt не повинен містити diff-маркери або '@@'
+        if grep -qE '^(diff --git|@@|\+{3}|\-{3})|@@' requirements.txt; then
+          echo "requirements.txt містить diff-маркери/@@. Встав чистий список пакетів." >&2
+          exit 1
+        fi
+
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: "3.11"
+
 
     - name: Install deps
       run: |
