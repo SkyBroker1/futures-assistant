@@ -1,0 +1,1 @@
+{"ts": "2025-10-29T11:44:40.504898+00:00", "conf": 0.9, "quorum": "ok_fallback", "files": ["spot_ohlcv_v2.json", "derivs_signals_v2.json", "options_vola_v2.json", "macro_flows_v2.json", "tripack_meta_v2.json"], "flags": ["vol=hv_surrogate", "stables_suspicious_total<220B", "etf_fallback_sosovalue", "flow_weight_down"], "missing": ["etf_flows"]}
