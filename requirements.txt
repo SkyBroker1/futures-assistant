@@ -1,11 +1,5 @@
-@@
--requests
--numpy
--pandas
--beautifulsoup4
--lxml
-+requests==2.32.3
-+numpy==1.26.4
-+pandas==2.2.2
-+beautifulsoup4==4.12.3
-+lxml==5.2.1
+requests==2.32.3
+numpy==1.26.4
+pandas==2.2.2
+beautifulsoup4==4.12.3
+lxml==5.2.1
