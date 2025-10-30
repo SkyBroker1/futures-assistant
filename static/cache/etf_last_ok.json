@@ -1,0 +1,7 @@
+{
+  "ts": 1735555200,
+  "source": "cache:seed",
+  "rows": [
+    { "date": "2025-01-01", "issuer": "SeedCache", "flow": "+10,000" }
+  ]
+}
