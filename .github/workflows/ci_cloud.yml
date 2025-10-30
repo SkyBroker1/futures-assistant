@@ -63,6 +63,22 @@ jobs:
           test -f scripts/postprocess_fill_missing.py || { echo "missing scripts/postprocess_fill_missing.py"; exit 2; }
           test -f scripts/check_quorum.py || { echo "missing scripts/check_quorum.py"; exit 2; }
           echo "[PRE] ok"
+          
+      - name: Syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/*.py
+          python - <<'PY'
+          import ast, glob, sys
+          bad = False
+          for p in glob.glob("scripts/*.py"):
+              try: ast.parse(open(p,"r",encoding="utf-8").read(), filename=p)
+              except SyntaxError as e:
+                  print(f"[AST] SyntaxError in {p}: {e}")
+                  bad = True
+          sys.exit(1 if bad else 0)
+          PY
 
       - name: Run collector
         id: collect
