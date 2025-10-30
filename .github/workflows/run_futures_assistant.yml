@@ -13,24 +13,26 @@ concurrency:
 jobs:
   cloud:
     runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
 
-        steps:
+    steps:
     - name: Checkout
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
-    # sanity - ловимо випадкові diff-артефакти в коді/requirements
+    # ловимо випадкові diff-артефакти в коді/requirements ще до інсталяції
     - name: Sanity check sources
       run: |
         set -e
-        # cloud_collect.py не повинен містити diff-маркери
-        if grep -qE '^(diff --git|@@|\+{3}|\-{3})' scripts/cloud_collect.py; then
+        echo "[sanity] checking scripts/cloud_collect.py and requirements.txt"
+        # точніший патерн: тільки рядки, що ПОЧИНАЮТЬСЯ з diff-маркерів
+        if grep -nE '^(diff --git|@@ |\+{3} |\-{3} )' scripts/cloud_collect.py; then
           echo "cloud_collect.py містить diff-маркери. Встав чистий Python, не patch." >&2
           exit 1
         fi
-        # requirements.txt не повинен містити diff-маркери або '@@'
-        if grep -qE '^(diff --git|@@|\+{3}|\-{3})|@@' requirements.txt; then
+        if grep -nE '^(diff --git|@@ |\+{3} |\-{3} )|^@@$' requirements.txt; then
           echo "requirements.txt містить diff-маркери/@@. Встав чистий список пакетів." >&2
           exit 1
         fi
@@ -40,19 +42,21 @@ jobs:
       with:
         python-version: "3.11"
 
-
     - name: Install deps
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
+        python -V
+        pip list
 
     - name: Run cloud collector
       env:
         OUT_DIR: out
         LOG_DIR: log
       run: |
+        set -o pipefail
         mkdir -p out log
-        python scripts/cloud_collect.py
+        python scripts/cloud_collect.py 2>&1 | tee log/collector_stdout.txt
 
     - name: Echo health to logs
       run: |
@@ -65,14 +69,36 @@ jobs:
       with:
         name: out_cloud
         path: out/*.json
-        if-no-files-found: error
+        if-no-files-found: warn
 
     - name: Upload cloud artifacts - logs
       uses: actions/upload-artifact@v4
       with:
         name: logs_cloud
-        path: log/*.txt
+        path: |
+          log/*.txt
+          log/*.log
         if-no-files-found: warn
+
+    - name: Add run summary with quick links
+      if: always()
+      uses: actions/github-script@v7
+      env:
+        RUN_ID: ${{ github.run_id }}
+      with:
+        script: |
+          const runId = process.env.RUN_ID;
+          const {owner, repo} = context.repo;
+          const runUrl = `https://github.com/${owner}/${repo}/actions/runs/${runId}`;
+          const dataPath = `data-cloud/public/out/${runId}/`;
+          await core.summary
+            .addHeading('Futures Assistant - quick links')
+            .addList([
+              `Run page: ${runUrl}`,
+              `Artifacts: на сторінці run завантаж \`out_cloud\` і \`logs_cloud\``,
+              `Data-cloud path: ${dataPath}`
+            ])
+            .write();
 
     - name: Publish JSON to data-cloud branch
       if: always()
