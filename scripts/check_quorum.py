@@ -68,4 +68,18 @@ def main():
         eprint("[SANITY] macro stables.total<=1e9 або etf.rows==0")
         return FAIL
     if checks.get('options_vola_ok') is False:
-        eprint("[SANITY] options_vola_v2.ok==fal
+        eprint("[SANITY] options_vola_v2.ok==false")
+        return FAIL
+
+    # 4) фінальне рішення по статусу
+    log = tripack.get('log', {})
+    quorum = log.get('quorum', 'fail')
+    if quorum not in ('ok', 'ok_fallback'):
+        eprint(f"[QUORUM] status '{quorum}' invalid, missing={log.get('missing', [])}, flags={log.get('flags', [])}")
+        return FAIL
+
+    print("[OK] quorum and sanity passed")
+    return OK
+
+if __name__ == '__main__':
+    sys.exit(main())
