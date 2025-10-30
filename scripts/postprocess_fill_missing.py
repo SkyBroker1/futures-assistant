@@ -2,14 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-postprocess_fill_missing.py v1.4
-Мета - гарантувати файли для кворуму навіть якщо collector впав:
-- SPOT autospot: тягнемо BTCUSDT 1d з Binance REST (публічно), пишемо spot_ohlcv_v2_part000.json,
-  синхронізуємо index.json.files.spot.files.
-- VOLA: рахуємо hv_surrogate з отриманих свічок, пишемо options_vola_v2.json.
-- MACRO: DeFiLlama + Farside -> SoSoValue, пишемо macro_flows_v2.json.
-- DERIVS: якщо collector не створив - пишемо безпечний stub з ок=false.
-- Оновлюємо tripack_meta_v2.json (checks, log.missing, log.flags, log.quorum) та index.json meta-вказівники.
+postprocess_fill_missing.py v1.5
+Гарантує випуск файлів для кворуму навіть за відсутності collector SPOT:
+- SPOT autospot (ревізія): три рівні джерел
+  1) Binance REST 1d свічки
+  2) CoinGecko market_chart 1d
+  3) fallback без свічок: тільки last price (без створення spot-файлу)
+- VOLA:
+  * якщо є свічки -> hv_surrogate з BTCUSDT (1d)
+  * якщо свічок немає -> hv_surrogate_const=60.0 з прапором vol:surrogate:const
+- MACRO: DeFiLlama + Farside -> SoSoValue
+- DERIVS: якщо collector не створив -> безпечний stub ok=false
+- Оновлення tripack_meta_v2.json (checks, log.missing, log.flags, log.quorum)
+- Синхронізація index.json meta-покажчиків
 """
 
 import argparse
@@ -25,7 +30,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
-# ----------------- helpers -----------------
+# ------------ utils ------------
 
 def log(msg: str, *, logfile: str | None = None) -> None:
     line = f"[POST] {msg}"
@@ -49,7 +54,7 @@ def dump_json(path: str, obj: Dict[str, Any]) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
-# ----------------- spot autoload (REST) -----------------
+# ------------ external fetchers ------------
 
 def fetch_binance_klines_btc_1d(limit: int = 180) -> List[List[float]]:
     url = "https://api.binance.com/api/v3/klines"
@@ -59,49 +64,40 @@ def fetch_binance_klines_btc_1d(limit: int = 180) -> List[List[float]]:
     data = r.json()
     candles = []
     for k in data:
-        # [open_time, open, high, low, close, volume, close_time, ...]
         ts = int(k[0])
         o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4]); v = float(k[5])
         candles.append([ts, o, h, l, c, v])
     if len(candles) < 30:
-        raise RuntimeError(f"too few candles from REST: {len(candles)}")
+        raise RuntimeError(f"too few candles from Binance: {len(candles)}")
     return candles
 
-def ensure_spot_and_index(out_dir: str, indexj: Dict[str, Any], logf: str | None = None) -> Tuple[Dict[str, Any], List[List[float]], bool]:
-    """
-    Якщо немає жодного spot-шарда - створюємо part000 з BTCUSDT 1d із REST.
-    Повертає: оновлений index, список свічок BTCUSDT 1d (для HV), прапор created.
-    Якщо шард уже є - читаємо його, повертаємо свічки для HV.
-    """
-    files_spot = indexj.get("files", {}).get("spot", {}).get("files", [])
-    if files_spot:
-        # пробуємо прочитати перший шард і витягнути BTCUSDT 1d
-        shard_path = os.path.join(out_dir, files_spot[0])
-        if ensure_file(shard_path):
-            shard = load_json(shard_path)
-            closes = _extract_btc_closes(shard)
-            if closes:
-                log(f"spot shard already present: {files_spot[0]} (closes={len(closes)})", logfile=logf)
-                return indexj, closes, False
-            else:
-                log("existing spot shard found but no BTCUSDT 1d - will create autospot as degraded", logfile=logf)
+def fetch_coingecko_btc_daily(limit_days: int = 180) -> List[List[float]]:
+    # daily prices in [timestamp_ms, price] pairs
+    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+    qs = {"vs_currency": "usd", "days": str(limit_days), "interval": "daily"}
+    r = requests.get(url, params=qs, timeout=25)
+    r.raise_for_status()
+    data = r.json()
+    arr = data.get("prices") or []
+    if len(arr) < 30:
+        raise RuntimeError(f"too few points from CoinGecko: {len(arr)}")
+    # перетворюємо у [ts, o,h,l,c,v] - візьмемо тільки close як price
+    candles = []
+    for ts, price in arr:
+        c = float(price)
+        candles.append([int(ts), c, c, c, c, 0.0])
+    return candles
 
-    # створюємо autospot
-    candles = fetch_binance_klines_btc_1d(limit=180)
-    shard = [{"symbol": "BTCUSDT", "tf": "1d", "candles": candles}]
-    shard_name = "spot_ohlcv_v2_part000.json"
-    shard_path = os.path.join(out_dir, shard_name)
-    dump_json(shard_path, shard)
-
-    files = indexj.setdefault("files", {})
-    files.setdefault("spot", {})["files"] = [shard_name]
-    dump_json(os.path.join(out_dir, "index.json"), indexj)
-
-    log(f"created autospot shard: {shard_name} rows={len(candles)}", logfile=logf)
-    return indexj, candles, True
+def fetch_binance_last_price() -> float | None:
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BTCUSDT"}, timeout=15)
+        r.raise_for_status()
+        return float((r.json() or {}).get("price"))
+    except Exception:
+        return None
 
 
-# ----------------- HV from closes -----------------
+# ------------ hv helpers ------------
 
 def hv_from_closes(closes: List[float], tf: str = "1d") -> float:
     if len(closes) < 30:
@@ -117,33 +113,27 @@ def hv_from_closes(closes: List[float], tf: str = "1d") -> float:
     hv_annual = statistics.pstdev(rets) * math.sqrt(scale)
     return round(hv_annual * 100, 2)
 
-
-def _extract_btc_closes(spot_obj: Any) -> List[float]:
-    # підтримка форматів: список записів або dict з rows/data
-    def extract_from_rec(rec: Dict[str, Any]) -> List[float] | None:
+def extract_btc_closes_from_shard(spot_obj: Any) -> List[float]:
+    def ext(rec: Dict[str, Any]) -> List[float] | None:
         if rec.get("symbol") == "BTCUSDT" and rec.get("tf") in ("1d", "4h"):
             candles = rec.get("candles") or rec.get("ohlcv") or []
             closes = [c[4] for c in candles if isinstance(c, (list, tuple)) and len(c) >= 5]
             return closes if closes else None
         return None
-
     if isinstance(spot_obj, list):
         for rec in spot_obj:
             if isinstance(rec, dict):
-                closes = extract_from_rec(rec)
-                if closes:
-                    return closes
+                x = ext(rec)
+                if x: return x
     if isinstance(spot_obj, dict):
-        rows = spot_obj.get("rows") or spot_obj.get("data") or []
-        for rec in rows:
+        for rec in (spot_obj.get("rows") or spot_obj.get("data") or []):
             if isinstance(rec, dict):
-                closes = extract_from_rec(rec)
-                if closes:
-                    return closes
+                x = ext(rec)
+                if x: return x
     return []
 
 
-# ----------------- macro fetch -----------------
+# ------------ macro fetch ------------
 
 def fetch_stables_and_etf(logf: str | None = None) -> Dict[str, Any]:
     stables_total = None
@@ -200,7 +190,7 @@ def fetch_stables_and_etf(logf: str | None = None) -> Dict[str, Any]:
     return {"stables": {"total": stables_total}, "etf": {"rows": etf_rows[:50], "source": etf_source}}
 
 
-# ----------------- main -----------------
+# ------------ main ------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -236,28 +226,60 @@ def main():
     indexj = load_json(index_path)
     tripack = load_json(tripack_path)
 
-    # 1) SPOT + closes для HV
-    created_autospot = False
+    # 1) SPOT: спроба прочитати наявний шард
+    spot_files = indexj.get("files", {}).get("spot", {}).get("files", [])
     closes_for_hv: List[float] = []
-    try:
-        indexj, candles, created = ensure_spot_and_index(out_dir, indexj, logf=post_log)
-        created_autospot = created
-        closes_for_hv = [c[4] for c in candles]
-        if created_autospot:
-            tripack.setdefault("log", {}).setdefault("flags", []).extend(["spot:fallback:binance_rest", "spot:degraded:btc-only"])
-    except Exception as e:
-        tripack.setdefault("log", {}).setdefault("missing", []).append("spot_ohlcv_v2_partNNN.json")
-        tripack.setdefault("log", {}).setdefault("flags", []).append(f"spot:fallback_failed:{e}")
-        closes_for_hv = []
+    created_autospot = False
 
-    # 2) DERIVS stub якщо відсутній
+    if spot_files:
+        try:
+            shard_obj = load_json(os.path.join(out_dir, spot_files[0]))
+            closes_for_hv = extract_btc_closes_from_shard(shard_obj)
+            log(f"found existing spot shard {spot_files[0]} closes={len(closes_for_hv)}", logfile=post_log)
+        except Exception as e:
+            log(f"spot shard read error: {e}", logfile=post_log)
+
+    # 2) Якщо немає свічок - 2 джерела REST
+    if not closes_for_hv:
+        # Binance
+        try:
+            candles = fetch_binance_klines_btc_1d(limit=180)
+            closes_for_hv = [c[4] for c in candles]
+            shard = [{"symbol": "BTCUSDT", "tf": "1d", "candles": candles}]
+            shard_name = "spot_ohlcv_v2_part000.json"
+            dump_json(os.path.join(out_dir, shard_name), shard)
+            indexj.setdefault("files", {}).setdefault("spot", {})["files"] = [shard_name]
+            dump_json(index_path, indexj)
+            created_autospot = True
+            tripack.setdefault("log", {}).setdefault("flags", []).extend(["spot:fallback:binance_rest", "spot:degraded:btc-only"])
+            log(f"created autospot from Binance: {shard_name} rows={len(candles)}", logfile=post_log)
+        except Exception as e:
+            log(f"binance klines error: {e}", logfile=post_log)
+
+    if not closes_for_hv:
+        # CoinGecko
+        try:
+            candles = fetch_coingecko_btc_daily(limit_days=180)
+            closes_for_hv = [c[4] for c in candles]
+            shard = [{"symbol": "BTCUSDT", "tf": "1d", "candles": candles}]
+            shard_name = "spot_ohlcv_v2_part000.json"
+            dump_json(os.path.join(out_dir, shard_name), shard)
+            indexj.setdefault("files", {}).setdefault("spot", {})["files"] = [shard_name]
+            dump_json(index_path, indexj)
+            created_autospot = True
+            tripack.setdefault("log", {}).setdefault("flags", []).extend(["spot:fallback:coingecko", "spot:degraded:btc-only"])
+            log(f"created autospot from CoinGecko: {shard_name} rows={len(candles)}", logfile=post_log)
+        except Exception as e:
+            log(f"coingecko fallback error: {e}", logfile=post_log)
+
+    # 3) DERIVS stub при відсутності
     if not ensure_file(derivs_path):
         derivs_stub = {"ok": False, "flags": ["derivs:stub"], "note": "Collector did not produce derivs_signals_v2.json - stubbed."}
         dump_json(derivs_path, derivs_stub)
         tripack.setdefault("log", {}).setdefault("flags", []).append("derivs:stub")
         log("derivs_signals_v2.json created as stub", logfile=post_log)
 
-    # 3) MACRO
+    # 4) MACRO
     if not ensure_file(macro_path):
         macro = fetch_stables_and_etf(logf=post_log)
         flags: List[str] = []
@@ -271,7 +293,6 @@ def main():
             ok = False; flags.append("macro:etf_missing")
         elif etf_source == "sosovalue":
             flags.append("macro:fallback:sosovalue")
-
         out_obj = {"ok": ok, "stables": {"total": st_total}, "etf": {"rows": etf_rows, "source": etf_source}, "flags": flags}
         dump_json(macro_path, out_obj)
         tripack.setdefault("checks", {})["macro_quorum"] = bool(ok and (st_total or 0) > 1e9 and len(etf_rows) > 0)
@@ -288,7 +309,7 @@ def main():
         except Exception:
             tripack.setdefault("checks", {})["macro_quorum"] = False
 
-    # 4) VOLA з closes_for_hv
+    # 5) VOLA
     if not ensure_file(vola_path):
         try:
             if closes_for_hv:
@@ -302,14 +323,30 @@ def main():
                         "ETH": {"hv_annual_pct": round(hv_pct * 0.9, 2)}
                     },
                     "flags": ["vol:surrogate:hv"],
-                    "notes": "Computed from Binance REST BTCUSDT 1d closes"
+                    "notes": "Computed from 1d closes (Binance/CoinGecko fallback)"
                 }
                 dump_json(vola_path, vola)
                 tripack.setdefault("checks", {})["options_vola_ok"] = True
                 tripack.setdefault("log", {}).setdefault("flags", []).append("vol:surrogate:hv")
                 log(f"options_vola_v2.json created via hv_surrogate hv%={hv_pct}", logfile=post_log)
             else:
-                raise RuntimeError("no closes for HV")
+                # крайній фолбек: константна HV
+                const_hv = 60.0
+                vola = {
+                    "ok": True,
+                    "mode": "hv_surrogate_const",
+                    "asof_ms": int(time.time() * 1000),
+                    "symbols": {
+                        "BTC": {"hv_annual_pct": const_hv},
+                        "ETH": {"hv_annual_pct": round(const_hv * 0.9, 2)}
+                    },
+                    "flags": ["vol:surrogate:const"],
+                    "notes": "No candles available; constant surrogate HV applied"
+                }
+                dump_json(vola_path, vola)
+                tripack.setdefault("checks", {})["options_vola_ok"] = True
+                tripack.setdefault("log", {}).setdefault("flags", []).append("vol:surrogate:const")
+                log("options_vola_v2.json created via constant surrogate HV", logfile=post_log)
         except Exception as e:
             tripack.setdefault("checks", {})["options_vola_ok"] = False
             tripack.setdefault("log", {}).setdefault("missing", []).append("options_vola_v2.json")
@@ -318,17 +355,19 @@ def main():
     else:
         tripack.setdefault("checks", {})["options_vola_ok"] = True
 
-    # 5) SANITY: btc_close_gt_1000
+    # 6) SANITY btc_close_gt_1000
     try:
-        last_close = closes_for_hv[-1] if closes_for_hv else 0.0
-        tripack.setdefault("checks", {})["btc_close_gt_1000"] = bool(last_close and last_close > 1000.0)
+        last_close = closes_for_hv[-1] if closes_for_hv else None
+        if not last_close:
+            last_close = fetch_binance_last_price()
+        tripack.setdefault("checks", {})["btc_close_gt_1000"] = bool(last_close and float(last_close) > 1000.0)
         if not tripack["checks"]["btc_close_gt_1000"]:
             tripack.setdefault("log", {}).setdefault("flags", []).append("spot:sanity:bld_1000")
     except Exception as e:
         tripack.setdefault("checks", {})["btc_close_gt_1000"] = False
         tripack.setdefault("log", {}).setdefault("flags", []).append(f"spot:sanity:error:{e}")
 
-    # 6) sync index meta pointers
+    # 7) sync index pointers
     files_block = indexj.setdefault("files", {})
     files_block.setdefault("derivs", {})["file"] = "derivs_signals_v2.json" if ensure_file(derivs_path) else None
     files_block.setdefault("vola", {})["file"] = "options_vola_v2.json" if ensure_file(vola_path) else None
@@ -336,7 +375,7 @@ def main():
     files_block.setdefault("meta", {})["files"] = ["tripack_meta_v2.json", "run_meta.json"]
     dump_json(index_path, indexj)
 
-    # 7) finalize quorum
+    # 8) finalize quorum
     log_block = tripack.setdefault("log", {})
     log_block["missing"] = list(dict.fromkeys(log_block.get("missing", [])))
     ok_all = (
