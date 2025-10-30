@@ -19,6 +19,10 @@ env:
   LOGS_DIR: logs_cloud
   DATA_BRANCH: data-cloud
 
+permissions:
+  contents: write
+  actions: read
+
 jobs:
   cloud:
     runs-on: ubuntu-latest
@@ -37,15 +41,25 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           python -V
           python -m pip install --upgrade pip
           pip install requests numpy pandas beautifulsoup4 lxml
-          # якщо є локальні requirements.txt - використаємо також
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Create dirs
         run: |
+          set -euo pipefail
           mkdir -p "${OUT_DIR}" "${LOGS_DIR}"
+
+      - name: Preflight check
+        run: |
+          set -euo pipefail
+          echo "[PRE] checking scripts existence"
+          test -f scripts/cloud_collect.py || { echo "missing scripts/cloud_collect.py"; exit 2; }
+          test -f scripts/postprocess_fill_missing.py || { echo "missing scripts/postprocess_fill_missing.py"; exit 2; }
+          test -f scripts/check_quorum.py || { echo "missing scripts/check_quorum.py"; exit 2; }
+          echo "[PRE] ok"
 
       - name: Run collector
         id: collect
@@ -53,14 +67,18 @@ jobs:
         env:
           RUN_TAG: ${{ github.event.inputs.run_tag }}
         run: |
-          set -e
+          set -euo pipefail
           echo "[INFO] start collector"
+          set +e
           python scripts/cloud_collect.py \
             --out "${OUT_DIR}" \
             --logs "${LOGS_DIR}" \
             --run-tag "${RUN_TAG}" \
-            2>&1 | tee "${LOGS_DIR}/collector_stdout.txt" || true
-          echo "[INFO] collector finished (errors are tolerated to allow post-fallback step)"
+            2>&1 | tee "${LOGS_DIR}/collector_stdout.txt"
+          RC=${PIPESTATUS[0]}
+          echo "${RC}" > "${LOGS_DIR}/collector_rc.txt"
+          echo "[INFO] collector finished with rc=${RC} (postprocess will run anyway)"
+          set -e
 
       - name: Upload intermediate artifacts (raw)
         if: always()
@@ -68,26 +86,29 @@ jobs:
         with:
           name: raw_${{ github.run_id }}
           path: |
-            ${OUT_DIR}/
-            ${LOGS_DIR}/
+            ${{ env.OUT_DIR }}/
+            ${{ env.LOGS_DIR }}/
           if-no-files-found: warn
           retention-days: 7
 
       - name: Postprocess fallbacks - fill missing files
         id: postprocess
         run: |
-          set -e
+          set -euo pipefail
           echo "[INFO] postprocess_fill_missing.py"
           python scripts/postprocess_fill_missing.py \
             --out "${OUT_DIR}" \
             --logs "${LOGS_DIR}" \
-            --gh-run-id "${{ github.run_id }}" \
-            2>&1 | tee -a "${LOGS_DIR}/collector_stdout.txt"
+            --gh-run-id "${{ github.run_id }}"
+          echo "[INFO] OUT_DIR tree:"
+          ls -lah "${OUT_DIR}" || true
+          echo "[INFO] LOGS_DIR tree:"
+          ls -lah "${LOGS_DIR}" || true
 
       - name: Check quorum and sanity
         id: check
         run: |
-          set -e
+          set -euo pipefail
           echo "[INFO] check_quorum.py"
           python scripts/check_quorum.py \
             --out "${OUT_DIR}" \
@@ -99,8 +120,8 @@ jobs:
         with:
           name: out_${{ github.run_id }}
           path: |
-            ${OUT_DIR}/
-            ${LOGS_DIR}/
+            ${{ env.OUT_DIR }}/
+            ${{ env.LOGS_DIR }}/
           if-no-files-found: error
           retention-days: 30
 
@@ -111,16 +132,15 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           COMMIT_MSG: ${{ github.event.inputs.commit_msg }}
         run: |
-          set -e
+          set -euo pipefail
           echo "[INFO] publishing to data-cloud branch"
           RUN_DIR="public/out/${RUN_ID}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # створюємо локальну копію data-cloud
-          git fetch origin ${DATA_BRANCH}:${DATA_BRANCH} || true
-          git checkout ${DATA_BRANCH} || git checkout -b ${DATA_BRANCH}
+          git fetch origin $DATA_BRANCH:$DATA_BRANCH || true
+          git checkout $DATA_BRANCH || git checkout -b $DATA_BRANCH
           mkdir -p "${RUN_DIR}"
-          cp -r "${OUT_DIR}/"* "${RUN_DIR}/"
+          cp -r "${OUT_DIR}/"* "${RUN_DIR}/" || { echo "no files in ${OUT_DIR}"; exit 3; }
           git add "${RUN_DIR}"
           git commit -m "${COMMIT_MSG:-ci: publish run ${RUN_ID}}" || echo "[INFO] nothing to commit"
-          git push origin ${DATA_BRANCH}
+          git push origin $DATA_BRANCH
