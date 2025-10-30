@@ -23,18 +23,19 @@ def main():
     tripack_path = os.path.join(out_dir, 'tripack_meta_v2.json')
     index_path = os.path.join(out_dir, 'index.json')
 
+    # 0) базові файли
     missing_hard = []
     for p in [tripack_path, index_path]:
         if not os.path.isfile(p):
-            missing_hard.append(p)
+            missing_hard.append(os.path.basename(p))
     if missing_hard:
-        eprint(f"[QUORUM] hard-missing files: {missing_hard}")
+        eprint(f"[QUORUM] hard-missing: {missing_hard}")
         return FAIL
 
     tripack = load_json(tripack_path)
     indexj = load_json(index_path)
 
-    # базові існування
+    # 1) наявність ключових JSON
     need_files = [
         'derivs_signals_v2.json',
         'options_vola_v2.json',
@@ -45,7 +46,7 @@ def main():
         if not os.path.isfile(os.path.join(out_dir, nf)):
             missing_hard.append(nf)
 
-    # spot шардінг - принаймні 1 файл
+    # 2) spot - принаймні один шард
     spot_files = []
     try:
         spot_files = indexj.get('files', {}).get('spot', {}).get('files', [])
@@ -58,37 +59,13 @@ def main():
         eprint(f"[QUORUM] missing files: {missing_hard}")
         return FAIL
 
-    # логіка кворуму згідно правил
-    log = tripack.get('log', {})
-    quorum = log.get('quorum', 'fail')
-    log_missing = log.get('missing', [])
-    flags = log.get('flags', [])
-
-    # sanity на BTC close - читаємо з tripack.summary якщо доступно
-    sanity_ok = tripack.get('checks', {}).get('btc_close_gt_1000', None)
-    if sanity_ok is False:
+    # 3) sanity checks з tripack
+    checks = tripack.get('checks', {})
+    if checks.get('btc_close_gt_1000') is False:
         eprint("[SANITY] BTCUSDT.last_close<=1000")
         return FAIL
-
-    # macro квоти
-    macro_ok = tripack.get('checks', {}).get('macro_quorum', None)
-    if macro_ok is False:
+    if checks.get('macro_quorum') is False:
         eprint("[SANITY] macro stables.total<=1e9 або etf.rows==0")
         return FAIL
-
-    # vola ok
-    vola_ok = tripack.get('checks', {}).get('options_vola_ok', None)
-    if vola_ok is False:
-        eprint("[SANITY] options_vola_v2.ok==false")
-        return FAIL
-
-    # фінальне рішення
-    if quorum not in ('ok', 'ok_fallback'):
-        eprint(f"[QUORUM] status '{quorum}' invalid, missing={log_missing}, flags={flags}")
-        return FAIL
-
-    print("[OK] quorum and sanity passed")
-    return OK
-
-if __name__ == '__main__':
-    sys.exit(main())
+    if checks.get('options_vola_ok') is False:
+        eprint("[SANITY] options_vola_v2.ok==fal
