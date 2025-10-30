@@ -4,17 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       run_tag:
-        description: 'Optional run tag shown in run_meta.json'
+        description: Optional run tag shown in run_meta.json
         required: false
-        default: ''
+        default: ""
       commit_msg:
-        description: 'Optional commit message to data-cloud branch'
+        description: Optional commit message to data-cloud branch
         required: false
-        default: 'ci: publish run outputs'
+        default: "ci: publish run outputs"
 
 env:
-  PYTHONUNBUFFERED: '1'
-  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
   OUT_DIR: out_cloud
   LOGS_DIR: logs_cloud
   DATA_BRANCH: data-cloud
@@ -37,9 +37,10 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
+        shell: bash
         run: |
           set -euo pipefail
           python -V
@@ -48,11 +49,13 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Create dirs
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p "${OUT_DIR}" "${LOGS_DIR}"
 
       - name: Preflight check
+        shell: bash
         run: |
           set -euo pipefail
           echo "[PRE] checking scripts existence"
@@ -91,4 +94,63 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Postproc
+      - name: Postprocess fallbacks - fill missing files
+        id: postprocess
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[INFO] postprocess_fill_missing.py"
+          python scripts/postprocess_fill_missing.py \
+            --out "${OUT_DIR}" \
+            --logs "${LOGS_DIR}" \
+            --gh-run-id "${{ github.run_id }}"
+          echo "[INFO] OUT_DIR tree:"
+          ls -lah "${OUT_DIR}" || true
+          echo "[INFO] LOGS_DIR tree:"
+          ls -lah "${LOGS_DIR}" || true
+          echo "[INFO] index.json:"
+          cat "${OUT_DIR}/index.json" || true
+          echo "[INFO] tripack_meta_v2.json:"
+          cat "${OUT_DIR}/tripack_meta_v2.json" || true
+
+      - name: Check quorum and sanity
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[INFO] check_quorum.py"
+          python scripts/check_quorum.py \
+            --out "${OUT_DIR}" \
+            --logs "${LOGS_DIR}"
+
+      - name: Upload artifacts (final)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: out_${{ github.run_id }}
+          path: |
+            ${{ env.OUT_DIR }}/
+            ${{ env.LOGS_DIR }}/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to data-cloud branch
+        if: ${{ steps.check.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          COMMIT_MSG: ${{ github.event.inputs.commit_msg }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[INFO] publishing to data-cloud branch"
+          RUN_DIR="public/out/${RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$DATA_BRANCH":"$DATA_BRANCH" || true
+          git checkout "$DATA_BRANCH" || git checkout -b "$DATA_BRANCH"
+          mkdir -p "${RUN_DIR}"
+          cp -r "${OUT_DIR}/"* "${RUN_DIR}/" || { echo "no files in ${OUT_DIR}"; exit 3; }
+          git add "${RUN_DIR}"
+          git commit -m "${COMMIT_MSG:-ci: publish run ${RUN_ID}}" || echo "[INFO] nothing to commit"
+          git push origin "$DATA_BRANCH"
