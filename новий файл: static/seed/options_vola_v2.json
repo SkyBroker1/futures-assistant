@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "mode": "hv_surrogate_const",
+  "asof_ms": 1735600000000,
+  "symbols": {
+    "BTC": { "hv_annual_pct": 60.0 },
+    "ETH": { "hv_annual_pct": 54.0 }
+  },
+  "flags": ["vol:surrogate:const"],
+  "notes": "seed constant HV for guaranteed quorum"
+}
