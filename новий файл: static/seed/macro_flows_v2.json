@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "stables": { "total": 235000000000 },
+  "etf": {
+    "source": "seed",
+    "rows": [
+      { "date": "2025-01-01", "issuer": "SeedCache", "flow": "+10,000" }
+    ]
+  },
+  "flags": ["macro:seed"]
+}
