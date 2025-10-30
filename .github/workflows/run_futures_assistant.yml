@@ -22,12 +22,10 @@ jobs:
       with:
         fetch-depth: 0
 
-    # ловимо випадкові diff-артефакти в коді/requirements ще до інсталяції
     - name: Sanity check sources
       run: |
         set -e
-        echo "[sanity] checking scripts/cloud_collect.py and requirements.txt"
-        # точніший патерн: тільки рядки, що ПОЧИНАЮТЬСЯ з diff-маркерів
+        echo "[sanity] checking sources"
         if grep -nE '^(diff --git|@@ |\+{3} |\-{3} )' scripts/cloud_collect.py; then
           echo "cloud_collect.py містить diff-маркери. Встав чистий Python, не patch." >&2
           exit 1
@@ -64,70 +62,34 @@ jobs:
         if [ -f out/index.json ]; then head -c 4000 out/index.json >> log/cloud.txt; echo "" >> log/cloud.txt; fi
         if [ -f out/tripack_meta_v2.json ]; then head -c 6000 out/tripack_meta_v2.json >> log/cloud.txt; echo "" >> log/cloud.txt; fi
 
-    - name: Upload cloud artifacts - out
-      uses: actions/upload-artifact@v4
-      with:
-        name: out_cloud
-        path: out/*.json
-        if-no-files-found: warn
-
-    - name: Upload cloud artifacts - logs
-      uses: actions/upload-artifact@v4
-      with:
-        name: logs_cloud
-        path: |
-          log/*.txt
-          log/*.log
-        if-no-files-found: warn
-
-    - name: Add run summary with quick links
+    - name: Summarize & validate
       if: always()
-      uses: actions/github-script@v7
-      env:
-        RUN_ID: ${{ github.run_id }}
-      with:
-        script: |
-          const runId = process.env.RUN_ID;
-          const {owner, repo} = context.repo;
-          const runUrl = `https://github.com/${owner}/${repo}/actions/runs/${runId}`;
-          const dataPath = `data-cloud/public/out/${runId}/`;
-          await core.summary
-            .addHeading('Futures Assistant - quick links')
-            .addList([
-              `Run page: ${runUrl}`,
-              `Artifacts: на сторінці run завантаж \`out_cloud\` і \`logs_cloud\``,
-              `Data-cloud path: ${dataPath}`
-            ])
-            .write();
-
-    - name: Publish JSON to data-cloud branch
-      if: always()
-      env:
-        RUN_ID: ${{ github.run_id }}
       run: |
-        set -e
-        git config --global --add safe.directory "$GITHUB_WORKSPACE"
-        git config user.name "github-actions"
-        git config user.email "actions@users.noreply.github.com"
-
-        SAFE_DIR="${RUNNER_TEMP}/out_publish"
-        mkdir -p "$SAFE_DIR"
-        cp -r out/*.json "$SAFE_DIR"/ 2>/dev/null || true
-
-        git fetch origin
-        if git ls-remote --exit-code --heads origin data-cloud; then
-          git checkout -B data-cloud origin/data-cloud
-        else
-          git checkout --orphan data-cloud
-          rm -rf * .[^.]* || true
-          echo "# data-cloud" > README.md
-          git add README.md
-          git commit -m "init data-cloud"
-          git push -u origin data-cloud
-        fi
-
-        mkdir -p "public/out/${RUN_ID}"
-        cp -r "$SAFE_DIR"/* "public/out/${RUN_ID}/" 2>/dev/null || true
-        git add -f "public/out/${RUN_ID}"/* 2>/dev/null || true
-        git commit -m "publish out for run ${RUN_ID}" || echo "nothing to commit"
-        git push origin data-cloud
+        python - << 'PY'
+        import json, os, glob, sys
+        def read(p):
+            try:
+                with open(p,'r',encoding='utf-8') as f: return json.load(f)
+            except Exception:
+                return None
+        out = {}
+        meta = read('out/tripack_meta_v2.json') or {}
+        idx  = read('out/index.json') or {}
+        macro= read('out/macro_flows_v2.json') or {}
+        vola = read('out/options_vola_v2.json') or {}
+        spot_parts = sorted(glob.glob('out/spot_ohlcv_v2_part*.json'))
+        spot_ok = bool(spot_parts)
+        reqs = {
+          "btc_close_gt_1000": "sanity:btc_close_le_1000_or_missing" not in (meta.get('log',{}).get('flags',[])),
+          "stables_gt_1e9": (macro.get('stables',{}).get('total') or 0) > 1e9,
+          "etf_rows_gt_0": (macro.get('etf',{}).get('rows') or 0) > 0,
+          "vol_ok": bool(vola.get('ok'))
+        }
+        conf = meta.get('conf')
+        quorum = meta.get('log',{}).get('quorum')
+        flags = meta.get('log',{}).get('flags',[])
+        print("=== SUMMARY ===")
+        print(f"conf={conf} quorum={quorum}")
+        print(f"checks: {reqs}")
+        print(f"flags: {flags}")
+        print(f"files: {list(idx.get('items',{}).get('files',{}).keys())}")
