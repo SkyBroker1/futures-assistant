@@ -94,7 +94,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Postprocess fallbacks - fill missing files
+            - name: Postprocess fallbacks - fill missing files
         id: postprocess
         shell: bash
         run: |
@@ -108,6 +108,8 @@ jobs:
           ls -lah "${OUT_DIR}" || true
           echo "[INFO] LOGS_DIR tree:"
           ls -lah "${LOGS_DIR}" || true
+          echo "[INFO] postprocess.log:"
+          cat "${LOGS_DIR}/postprocess.log" || true
           echo "[INFO] index.json:"
           cat "${OUT_DIR}/index.json" || true
           echo "[INFO] tripack_meta_v2.json:"
