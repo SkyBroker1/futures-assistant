@@ -1,0 +1,1 @@
+{"breadth_meta":{},"policy_flags":{"leader-lock":"OFF","flow-alignment":"UNC","mHedge":"UNC"},"conf":0.7,"log":{"quorum":"fail","missing":["macro_flows_v2.json","options_vola_v2.json"],"flags":["spot_part001:missing","sanity:btc_from_cg_fallback","vol:missing","macro:missing"]}}

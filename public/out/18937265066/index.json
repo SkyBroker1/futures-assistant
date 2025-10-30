@@ -1,0 +1,1 @@
+{"generated_at":"2025-10-30T10:18:09.343196+00:00","items":{"files":{"spot":{"files":[]},"derivs":{"file":"derivs_signals_v2.json"},"vola":{"file":"options_vola_v2.json"},"macro":{"file":"macro_flows_v2.json"}}},"conf":0.7,"policy_flags":{"leader-lock":"OFF","flow-alignment":"UNC","mHedge":"UNC"}}
