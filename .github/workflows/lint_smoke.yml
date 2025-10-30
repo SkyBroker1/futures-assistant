@@ -1,0 +1,95 @@
+name: Lint & Unit-SMOKE
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/**"
+      - "requirements.txt"
+
+jobs:
+  lint_smoke:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Sanity grep
+      run: |
+        set -e
+        for f in scripts/cloud_collect.py requirements.txt; do
+          if grep -nE '^(diff --git|@@ |\+{3} |\-{3} )|^@@$' "$f"; then
+            echo "[fail] $f містить diff-маркери/@@" >&2
+            exit 1
+          fi
+        done
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install minimal deps
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas beautifulsoup4 lxml requests
+
+    - name: Compile cloud_collect.py
+      run: |
+        python -m py_compile scripts/cloud_collect.py
+
+    - name: Offline unit-smoke (mock HTTP)
+      run: |
+        python - << 'PY'
+        import json, types
+        import scripts.cloud_collect as cc
+
+        class R:  # simple Response shim
+            def __init__(self, text=None, json_obj=None, status_code=200):
+                self._text=text; self._json=json_obj; self.status_code=status_code
+            @property
+            def text(self): return self._text or ""
+            def json(self): return self._json
+
+        def mock_get(url, params=None, headers=None, retries=1):
+            # return small fixtures per endpoint family
+            if "exchangeInfo" in url:
+                return R(json_obj={"symbols":[{"symbol":"BTCUSDT","quoteAsset":"USDT","status":"TRADING"},
+                                             {"symbol":"ETHUSDT","quoteAsset":"USDT","status":"TRADING"}]})
+            if "/ticker/24hr" in url:
+                return R(json_obj=[{"symbol":"BTCUSDT","quoteVolume":"999999"},{"symbol":"ETHUSDT","quoteVolume":"888888"}])
+            if "/klines" in url and "api.binance.com" in url:
+                k = [[1700000000000,"50000","51000","49000","50500","123.4"]] * 10
+                return R(json_obj=k)
+            if "/candles" in url:  # okx fallback
+                return R(json_obj={"data":[["1700000000000","50000","51000","49000","50500","123.4"]]})
+            if "premiumIndex" in url or "fundingRate" in url and "fapi" in url:
+                return R(json_obj=[{"symbol":"BTCUSDT","lastFundingRate":"0.0001","markPrice":"50500","fundingRate":"0.0001","fundingTime":1700000000000}])
+            if "open-interest" in url:
+                return R(json_obj={"data":[{"oi":"100"}]})
+            if "stablecoins.llama.fi" in url:
+                return R(json_obj={"totalCirculatingUSD": 230_000_000_000})
+            if "sosovalue.com" in url:
+                html = "<table><tr><th>a</th></tr><tr><td>1</td></tr></table>"
+                return R(text=html)
+            if "coingecko.com" in url and "market_chart" in url:
+                return R(json_obj={"prices":[[1700000000000, 50500.0]]})
+            if "coingecko.com" in url and "/coins/markets" in url:
+                return R(json_obj=[{"market_cap": 100_000_000_000},{"market_cap": 120_000_000_000}])
+            if "farside.co.uk" in url:
+                html = "<table><tr><th>a</th></tr><tr><td>1</td></tr></table>"
+                return R(text=html)
+            return R(status_code=404, json_obj={"err":"no route"})
+
+        cc._http_get = mock_get  # monkeypatch
+        idx = {"files":{}}
+        idx["files"]["spot"] = cc.collect_spot_ohlcv()
+        idx["files"]["derivs"] = cc.collect_derivs_signals()
+        idx["files"]["vola"] = cc.collect_options_vola()
+        idx["files"]["macro"] = cc.collect_macro_flows()
+        meta = cc.build_tripack_meta(idx)
+        print("SMOKE OK:", json.dumps({"conf":meta["conf"],"quorum":meta["log"]["quorum"],"flags":meta["log"]["flags"]})[:400])
+        PY
