@@ -2,19 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-postprocess_fill_missing.py v1.5
-Гарантує випуск файлів для кворуму навіть за відсутності collector SPOT:
-- SPOT autospot (ревізія): три рівні джерел
-  1) Binance REST 1d свічки
-  2) CoinGecko market_chart 1d
-  3) fallback без свічок: тільки last price (без створення spot-файлу)
-- VOLA:
-  * якщо є свічки -> hv_surrogate з BTCUSDT (1d)
-  * якщо свічок немає -> hv_surrogate_const=60.0 з прапором vol:surrogate:const
-- MACRO: DeFiLlama + Farside -> SoSoValue
-- DERIVS: якщо collector не створив -> безпечний stub ok=false
-- Оновлення tripack_meta_v2.json (checks, log.missing, log.flags, log.quorum)
-- Синхронізація index.json meta-покажчиків
+postprocess_fill_missing.py v1.6
+Гарантія випуску всіх JSON для кворуму за будь-яких умов мережі.
+
+Фолбеки:
+- SPOT: Binance 1d -> CoinGecko 1d -> only last price (без spot-файлу, але sanity ок)
+- VOLA: hv з свічок або hv_const=60.0 з прапором vol:surrogate:const
+- MACRO: DeFiLlama + Farside -> SoSoValue -> CACHE static/cache/*
+- DERIVS: stub при відсутності
+- Кешування: якщо мережа працює і отримано валідні дані, зберігаємо їх у static/cache для майбутніх ранiв
+
+Позначки у tripack_meta_v2.json.log.flags:
+- spot:fallback:*
+- vol:surrogate:hv|const
+- macro:fallback:sosovalue|cache
+- macro:stables_cache
+- derivs:stub
 """
 
 import argparse
@@ -29,8 +32,7 @@ from typing import Any, Dict, List, Tuple
 import requests
 from bs4 import BeautifulSoup
 
-
-# ------------ utils ------------
+# ----------------- utils -----------------
 
 def log(msg: str, *, logfile: str | None = None) -> None:
     line = f"[POST] {msg}"
@@ -50,11 +52,11 @@ def load_json(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 def dump_json(path: str, obj: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
-
-# ------------ external fetchers ------------
+# ----------------- external fetchers -----------------
 
 def fetch_binance_klines_btc_1d(limit: int = 180) -> List[List[float]]:
     url = "https://api.binance.com/api/v3/klines"
@@ -72,7 +74,6 @@ def fetch_binance_klines_btc_1d(limit: int = 180) -> List[List[float]]:
     return candles
 
 def fetch_coingecko_btc_daily(limit_days: int = 180) -> List[List[float]]:
-    # daily prices in [timestamp_ms, price] pairs
     url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
     qs = {"vs_currency": "usd", "days": str(limit_days), "interval": "daily"}
     r = requests.get(url, params=qs, timeout=25)
@@ -81,7 +82,6 @@ def fetch_coingecko_btc_daily(limit_days: int = 180) -> List[List[float]]:
     arr = data.get("prices") or []
     if len(arr) < 30:
         raise RuntimeError(f"too few points from CoinGecko: {len(arr)}")
-    # перетворюємо у [ts, o,h,l,c,v] - візьмемо тільки close як price
     candles = []
     for ts, price in arr:
         c = float(price)
@@ -96,8 +96,7 @@ def fetch_binance_last_price() -> float | None:
     except Exception:
         return None
 
-
-# ------------ hv helpers ------------
+# ----------------- hv helpers -----------------
 
 def hv_from_closes(closes: List[float], tf: str = "1d") -> float:
     if len(closes) < 30:
@@ -132,11 +131,9 @@ def extract_btc_closes_from_shard(spot_obj: Any) -> List[float]:
                 if x: return x
     return []
 
+# ----------------- macro fetch + cache -----------------
 
-# ------------ macro fetch ------------
-
-def fetch_stables_and_etf(logf: str | None = None) -> Dict[str, Any]:
-    stables_total = None
+def fetch_stables_defillama() -> float | None:
     try:
         r = requests.get("https://stablecoins.llama.fi/stablecoin/marketcap", timeout=25)
         r.raise_for_status()
@@ -148,49 +145,51 @@ def fetch_stables_and_etf(logf: str | None = None) -> Dict[str, Any]:
                 last = cur[-1]
                 if isinstance(last, list) and len(last) >= 2 and isinstance(last[1], (int, float)):
                     total += float(last[1])
-        stables_total = total
-        log(f"DeFiLlama stables total parsed: {round(stables_total or 0, 2)}", logfile=logf)
-    except Exception as e:
-        log(f"DeFiLlama fetch error: {e}", logfile=logf)
-        stables_total = None
+        return total
+    except Exception:
+        return None
 
-    etf_rows: List[Dict[str, Any]] = []
-    etf_source = "farside"
+def fetch_etf_farside() -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    fr = requests.get("https://www.farside.co.uk/bitcoin-spot-etf-flows", timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    fr.raise_for_status()
+    soup = BeautifulSoup(fr.text, "lxml")
+    table = soup.find("table")
+    if not table:
+        raise RuntimeError("no table on Farside")
+    for tr in table.find_all("tr")[1:]:
+        tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+        if len(tds) >= 3:
+            rows.append({"date": tds[0], "issuer": tds[1], "flow": tds[2]})
+    if not rows:
+        raise RuntimeError("empty Farside rows")
+    return rows
+
+def fetch_etf_sosovalue() -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    sr = requests.get("https://sosovalue.xyz/article/bitcoin-etf-data", timeout=25,
+                      headers={"User-Agent": "Mozilla/5.0", "Referer": "https://sosovalue.xyz"})
+    sr.raise_for_status()
+    soup = BeautifulSoup(sr.text, "lxml")
+    for tr in soup.find_all("tr"):
+        tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+        if len(tds) >= 3 and any(x.lower().startswith("20") for x in tds):
+            rows.append({"date": tds[0], "issuer": tds[1], "flow": tds[2]})
+    return rows
+
+def read_cache(cache_path: str) -> Dict[str, Any] | None:
     try:
-        fr = requests.get("https://www.farside.co.uk/bitcoin-spot-etf-flows", timeout=25, headers={"User-Agent": "Mozilla/5.0"})
-        fr.raise_for_status()
-        soup = BeautifulSoup(fr.text, "lxml")
-        table = soup.find("table")
-        if not table:
-            raise RuntimeError("no table on Farside")
-        for tr in table.find_all("tr")[1:]:
-            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(tds) >= 3:
-                etf_rows.append({"date": tds[0], "issuer": tds[1], "flow": tds[2]})
-        if not etf_rows:
-            raise RuntimeError("empty Farside rows")
-        log(f"Farside parsed rows: {len(etf_rows)}", logfile=logf)
-    except Exception as e:
-        log(f"Farside error: {e} - switching to SoSoValue fallback", logfile=logf)
-        etf_source = "sosovalue"
-        etf_rows = []
-        try:
-            sr = requests.get("https://sosovalue.xyz/article/bitcoin-etf-data", timeout=25, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://sosovalue.xyz"})
-            sr.raise_for_status()
-            soup = BeautifulSoup(sr.text, "lxml")
-            for tr in soup.find_all("tr"):
-                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if len(tds) >= 3 and any(x.lower().startswith("20") for x in tds):
-                    etf_rows.append({"date": tds[0], "issuer": tds[1], "flow": tds[2]})
-            log(f"SoSoValue parsed rows: {len(etf_rows)}", logfile=logf)
-        except Exception as ee:
-            log(f"SoSoValue error: {ee}", logfile=logf)
-            etf_rows = []
+        return load_json(cache_path) if ensure_file(cache_path) else None
+    except Exception:
+        return None
 
-    return {"stables": {"total": stables_total}, "etf": {"rows": etf_rows[:50], "source": etf_source}}
+def write_cache(cache_path: str, obj: Dict[str, Any]) -> None:
+    try:
+        dump_json(cache_path, obj)
+    except Exception:
+        pass
 
-
-# ------------ main ------------
+# ----------------- main -----------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -226,11 +225,9 @@ def main():
     indexj = load_json(index_path)
     tripack = load_json(tripack_path)
 
-    # 1) SPOT: спроба прочитати наявний шард
+    # ---------- SPOT & VOLA ----------
     spot_files = indexj.get("files", {}).get("spot", {}).get("files", [])
     closes_for_hv: List[float] = []
-    created_autospot = False
-
     if spot_files:
         try:
             shard_obj = load_json(os.path.join(out_dir, spot_files[0]))
@@ -238,10 +235,7 @@ def main():
             log(f"found existing spot shard {spot_files[0]} closes={len(closes_for_hv)}", logfile=post_log)
         except Exception as e:
             log(f"spot shard read error: {e}", logfile=post_log)
-
-    # 2) Якщо немає свічок - 2 джерела REST
     if not closes_for_hv:
-        # Binance
         try:
             candles = fetch_binance_klines_btc_1d(limit=180)
             closes_for_hv = [c[4] for c in candles]
@@ -250,14 +244,11 @@ def main():
             dump_json(os.path.join(out_dir, shard_name), shard)
             indexj.setdefault("files", {}).setdefault("spot", {})["files"] = [shard_name]
             dump_json(index_path, indexj)
-            created_autospot = True
             tripack.setdefault("log", {}).setdefault("flags", []).extend(["spot:fallback:binance_rest", "spot:degraded:btc-only"])
             log(f"created autospot from Binance: {shard_name} rows={len(candles)}", logfile=post_log)
         except Exception as e:
             log(f"binance klines error: {e}", logfile=post_log)
-
     if not closes_for_hv:
-        # CoinGecko
         try:
             candles = fetch_coingecko_btc_daily(limit_days=180)
             closes_for_hv = [c[4] for c in candles]
@@ -266,50 +257,81 @@ def main():
             dump_json(os.path.join(out_dir, shard_name), shard)
             indexj.setdefault("files", {}).setdefault("spot", {})["files"] = [shard_name]
             dump_json(index_path, indexj)
-            created_autospot = True
             tripack.setdefault("log", {}).setdefault("flags", []).extend(["spot:fallback:coingecko", "spot:degraded:btc-only"])
             log(f"created autospot from CoinGecko: {shard_name} rows={len(candles)}", logfile=post_log)
         except Exception as e:
             log(f"coingecko fallback error: {e}", logfile=post_log)
 
-    # 3) DERIVS stub при відсутності
+    # DERIVS stub
     if not ensure_file(derivs_path):
         derivs_stub = {"ok": False, "flags": ["derivs:stub"], "note": "Collector did not produce derivs_signals_v2.json - stubbed."}
         dump_json(derivs_path, derivs_stub)
         tripack.setdefault("log", {}).setdefault("flags", []).append("derivs:stub")
         log("derivs_signals_v2.json created as stub", logfile=post_log)
 
-    # 4) MACRO
-    if not ensure_file(macro_path):
-        macro = fetch_stables_and_etf(logf=post_log)
-        flags: List[str] = []
-        ok = True
-        st_total = macro.get("stables", {}).get("total")
-        if st_total is None:
-            ok = False; flags.append("macro:stables_missing")
-        etf_rows = macro.get("etf", {}).get("rows", [])
-        etf_source = macro.get("etf", {}).get("source", "unknown")
-        if not etf_rows:
-            ok = False; flags.append("macro:etf_missing")
-        elif etf_source == "sosovalue":
-            flags.append("macro:fallback:sosovalue")
-        out_obj = {"ok": ok, "stables": {"total": st_total}, "etf": {"rows": etf_rows, "source": etf_source}, "flags": flags}
-        dump_json(macro_path, out_obj)
-        tripack.setdefault("checks", {})["macro_quorum"] = bool(ok and (st_total or 0) > 1e9 and len(etf_rows) > 0)
-        if not tripack["checks"]["macro_quorum"]:
-            tripack.setdefault("log", {}).setdefault("missing", []).append("macro_flows_v2.json")
-            tripack.setdefault("log", {}).setdefault("flags", []).extend(flags)
-        log(f"macro_flows_v2.json created - ok={out_obj['ok']} source={etf_source} rows={len(etf_rows)}", logfile=post_log)
-    else:
-        try:
-            mm = load_json(macro_path)
-            st_total = (mm.get("stables") or {}).get("total")
-            etf_rows = (mm.get("etf") or {}).get("rows") or []
-            tripack.setdefault("checks", {})["macro_quorum"] = bool((st_total or 0) > 1e9 and len(etf_rows) > 0)
-        except Exception:
-            tripack.setdefault("checks", {})["macro_quorum"] = False
+    # ---------- MACRO ----------
+    cache_dir = os.path.join("static", "cache")
+    cache_etf = os.path.join(cache_dir, "etf_last_ok.json")
+    cache_stb = os.path.join(cache_dir, "stables_last_ok.json")
 
-    # 5) VOLA
+    st_total = fetch_stables_defillama()
+    etf_rows = []
+    etf_source = "farside"
+    flags: List[str] = []
+
+    if st_total is None:
+        # спробуємо cache
+        cache = read_cache(cache_stb)
+        if cache and isinstance(cache.get("total"), (int, float)):
+            st_total = float(cache["total"])
+            flags.append("macro:stables_cache")
+            log(f"used stables cache: total={st_total}", logfile=post_log)
+
+    # ETF: Farside -> SoSoValue -> cache
+    try:
+        etf_rows = fetch_etf_farside()
+        etf_source = "farside"
+    except Exception as e:
+        log(f"Farside error: {e}", logfile=post_log)
+        try:
+            etf_rows = fetch_etf_sosovalue()
+            etf_source = "sosovalue"
+            flags.append("macro:fallback:sosovalue")
+        except Exception as ee:
+            log(f"SoSoValue error: {ee}", logfile=post_log)
+            cache = read_cache(cache_etf)
+            if cache and isinstance(cache.get("rows"), list) and cache["rows"]:
+                etf_rows = cache["rows"]
+                etf_source = "cache"
+                flags.append("macro:fallback:cache")
+                log(f"used ETF cache rows={len(etf_rows)}", logfile=post_log)
+
+    ok_macro = bool((st_total or 0) > 1e9 and len(etf_rows) > 0)
+    macro_obj = {
+        "ok": ok_macro,
+        "stables": {"total": st_total},
+        "etf": {"rows": etf_rows, "source": etf_source},
+        "flags": flags
+    }
+    dump_json(macro_path, macro_obj)
+
+    # якщо мережа ок - запишемо кеш для наступних ранiв
+    try:
+        if (st_total or 0) > 1e9:
+            write_cache(cache_stb, {"total": float(st_total), "ts": int(time.time())})
+        if etf_rows:
+            write_cache(cache_etf, {"rows": etf_rows[:100], "ts": int(time.time()), "source": etf_source})
+    except Exception:
+        pass
+
+    tripack.setdefault("checks", {})["macro_quorum"] = ok_macro
+    if not ok_macro:
+        tripack.setdefault("log", {}).setdefault("missing", []).append("macro_flows_v2.json")
+        tripack.setdefault("log", {}).setdefault("flags", []).extend(flags or ["macro:missing"])
+
+    log(f"macro_flows_v2.json created - ok={ok_macro} source={etf_source} rows={len(etf_rows)} total={st_total}", logfile=post_log)
+
+    # ---------- VOLA ----------
     if not ensure_file(vola_path):
         try:
             if closes_for_hv:
@@ -330,7 +352,6 @@ def main():
                 tripack.setdefault("log", {}).setdefault("flags", []).append("vol:surrogate:hv")
                 log(f"options_vola_v2.json created via hv_surrogate hv%={hv_pct}", logfile=post_log)
             else:
-                # крайній фолбек: константна HV
                 const_hv = 60.0
                 vola = {
                     "ok": True,
@@ -355,11 +376,9 @@ def main():
     else:
         tripack.setdefault("checks", {})["options_vola_ok"] = True
 
-    # 6) SANITY btc_close_gt_1000
+    # ---------- SANITY ----------
     try:
-        last_close = closes_for_hv[-1] if closes_for_hv else None
-        if not last_close:
-            last_close = fetch_binance_last_price()
+        last_close = closes_for_hv[-1] if closes_for_hv else fetch_binance_last_price()
         tripack.setdefault("checks", {})["btc_close_gt_1000"] = bool(last_close and float(last_close) > 1000.0)
         if not tripack["checks"]["btc_close_gt_1000"]:
             tripack.setdefault("log", {}).setdefault("flags", []).append("spot:sanity:bld_1000")
@@ -367,7 +386,7 @@ def main():
         tripack.setdefault("checks", {})["btc_close_gt_1000"] = False
         tripack.setdefault("log", {}).setdefault("flags", []).append(f"spot:sanity:error:{e}")
 
-    # 7) sync index pointers
+    # ---------- sync index pointers ----------
     files_block = indexj.setdefault("files", {})
     files_block.setdefault("derivs", {})["file"] = "derivs_signals_v2.json" if ensure_file(derivs_path) else None
     files_block.setdefault("vola", {})["file"] = "options_vola_v2.json" if ensure_file(vola_path) else None
@@ -375,7 +394,7 @@ def main():
     files_block.setdefault("meta", {})["files"] = ["tripack_meta_v2.json", "run_meta.json"]
     dump_json(index_path, indexj)
 
-    # 8) finalize quorum
+    # ---------- finalize quorum ----------
     log_block = tripack.setdefault("log", {})
     log_block["missing"] = list(dict.fromkeys(log_block.get("missing", [])))
     ok_all = (
@@ -386,7 +405,7 @@ def main():
     )
     if ok_all:
         flags = log_block.get("flags", [])
-        tripack["log"]["quorum"] = "ok_fallback" if "macro:fallback:sosovalue" in flags else "ok"
+        tripack["log"]["quorum"] = "ok_fallback" if "macro:fallback:sosovalue" in flags or "macro:fallback:cache" in flags else "ok"
     else:
         tripack["log"]["quorum"] = "fail"
 
