@@ -1,78 +1,114 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, json, os, sys, time
-from typing import Any, Dict, List
+"""
+postprocess_fill_missing.py
+- Добиває відсутні JSON після collector:
+  * options_vola_v2.json: hv_surrogate з BTCUSDT, якщо DVOL/Volmex відсутні
+  * macro_flows_v2.json: DeFiLlama + Farside -> SoSoValue фолбек
+- Піднімає прапори у tripack_meta_v2.json.log.flags, оновлює checks і quorum
+- Не створює вигаданих spot або derivs, лише відмічає їх відсутність
+"""
 
+import argparse
+import json
+import os
+import sys
+import time
 import math
+import statistics
+from typing import Any, Dict, List, Tuple
+
 import requests
 from bs4 import BeautifulSoup
 
-def load_json(path: str) -> Dict[str, Any]:
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
 
-def dump_json(path: str, obj: Dict[str, Any]):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+# ---------- util ----------
+
+def log(msg: str, *, logfile: str | None = None) -> None:
+    line = f"[POST] {msg}"
+    print(line)
+    if logfile:
+        try:
+            with open(logfile, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
 
 def ensure_file(path: str) -> bool:
     return os.path.isfile(path) and os.path.getsize(path) > 0
 
-def log(msg: str):
-    print(f"[POST] {msg}")
 
-def try_calc_hv_from_spot(out_dir: str) -> Dict[str, Any]:
-    # шукаємо перший шард
-    idx = load_json(os.path.join(out_dir, 'index.json'))
-    spot_files: List[str] = idx.get('files', {}).get('spot', {}).get('files', [])
+def load_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def dump_json(path: str, obj: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+# ---------- hv surrogate ----------
+
+def _select_btc_series_from_spot(spot_obj: Any) -> Tuple[List[float], str]:
+    """
+    Повертає список цін закриття BTCUSDT та вибраний tf ('1d' або '4h'), або кидає помилку.
+    Підтримує кілька ймовірних форматів шард файлу.
+    """
+    # варіант: список записів
+    if isinstance(spot_obj, list):
+        for rec in spot_obj:
+            if isinstance(rec, dict) and rec.get("symbol") == "BTCUSDT" and rec.get("tf") in ("1d", "4h"):
+                candles = rec.get("candles") or rec.get("ohlcv") or []
+                closes = [c[4] for c in candles if isinstance(c, (list, tuple)) and len(c) >= 5]
+                if closes:
+                    return closes, rec.get("tf")
+    # варіант: словник з масивом у rows або data
+    if isinstance(spot_obj, dict):
+        rows = spot_obj.get("rows") or spot_obj.get("data") or []
+        for rec in rows:
+            if isinstance(rec, dict) and rec.get("symbol") == "BTCUSDT" and rec.get("tf") in ("1d", "4h"):
+                candles = rec.get("candles") or rec.get("ohlcv") or []
+                closes = [c[4] for c in candles if isinstance(c, (list, tuple)) and len(c) >= 5]
+                if closes:
+                    return closes, rec.get("tf")
+    raise RuntimeError("BTCUSDT series not found in spot shard")
+
+
+def try_calc_hv_from_spot(out_dir: str, logf: str | None = None) -> Dict[str, Any]:
+    # шукаємо перший шард у index.json
+    index_path = os.path.join(out_dir, "index.json")
+    if not ensure_file(index_path):
+        raise RuntimeError("index.json missing")
+
+    idx = load_json(index_path)
+    spot_files: List[str] = idx.get("files", {}).get("spot", {}).get("files", [])
     if not spot_files:
         raise RuntimeError("no spot shards to compute hv_surrogate")
 
-    # читаємо лише один шард для швидкого HV-сурогату
     shard_path = os.path.join(out_dir, spot_files[0])
-    spot = load_json(shard_path)
+    if not ensure_file(shard_path):
+        raise RuntimeError(f"spot shard missing: {spot_files[0]}")
 
-    # очікуваний формат: {"symbol":"BTCUSDT","tf":"1d","candles":[[ts,open,high,low,close,vol],...]} або подібний
-    # універсальний пошук свічок BTCUSDT 1d
-    btc = None
-    if isinstance(spot, dict) and 'tables' in spot:
-        # універсум може бути табличним - пропускаємо, адаптація під реальний формат за потреби
-        pass
-    # fallback - якщо шард містить список записів
-    if isinstance(spot, list):
-        # шукаємо запис з symbol=='BTCUSDT' і tf in {'1d','4h'}
-        for rec in spot:
-            if isinstance(rec, dict) and rec.get('symbol') == 'BTCUSDT' and rec.get('tf') in ('1d', '4h'):
-                btc = rec
-                break
-    elif isinstance(spot, dict):
-        # можливо один файл на багато символів
-        rows = spot.get('rows') or spot.get('data') or []
-        for rec in rows:
-            if isinstance(rec, dict) and rec.get('symbol') == 'BTCUSDT' and rec.get('tf') in ('1d','4h'):
-                btc = rec
-                break
-
-    if btc is None:
-        raise RuntimeError("BTCUSDT not found in spot shard for hv calculation")
-
-    candles = btc.get('candles') or btc.get('ohlcv') or []
-    closes = [c[4] for c in candles if isinstance(c, (list, tuple)) and len(c) >= 5]
+    spot_obj = load_json(shard_path)
+    closes, tf = _select_btc_series_from_spot(spot_obj)
     if len(closes) < 30:
         raise RuntimeError("not enough closes for hv surrogate")
 
     # лог-доходності
     rets = []
     for i in range(1, len(closes)):
-        if closes[i-1] and closes[i] and closes[i-1] > 0 and closes[i] > 0:
-            rets.append(math.log(closes[i] / closes[i-1]))
+        prev_c, cur_c = closes[i - 1], closes[i]
+        if prev_c and cur_c and prev_c > 0 and cur_c > 0:
+            rets.append(math.log(cur_c / prev_c))
     if len(rets) < 20:
         raise RuntimeError("not enough returns for hv surrogate")
 
-    # річна HV ~ std * sqrt(365) для 1d
-    import statistics, math
-    hv_annual = statistics.pstdev(rets) * math.sqrt(365.0)
+    # добуток на sqrt періоду - для 1d ~365, для 4h приблизно ~6 інтервалів/день -> 365*6
+    scale = 365.0 if tf == "1d" else 365.0 * 6.0
+    hv_annual = statistics.pstdev(rets) * math.sqrt(scale)
     hv_pct = round(hv_annual * 100, 2)
 
     now = int(time.time() * 1000)
@@ -82,75 +118,88 @@ def try_calc_hv_from_spot(out_dir: str) -> Dict[str, Any]:
         "asof_ms": now,
         "symbols": {
             "BTC": {"hv_annual_pct": hv_pct},
-            "ETH": {"hv_annual_pct": hv_pct * 0.9}
+            "ETH": {"hv_annual_pct": round(hv_pct * 0.9, 2)}
         },
         "flags": ["vol:surrogate:hv"],
-        "notes": "Computed from spot BTCUSDT 1d closes"
+        "notes": f"Computed from spot BTCUSDT closes, tf={tf}"
     }
+    log(f"hv_surrogate computed: BTC hv%={hv_pct}", logfile=logf)
     return vola
 
-def fetch_stables_and_etf() -> Dict[str, Any]:
-    # DeFiLlama stables total
+
+# ---------- macro fetch ----------
+
+def fetch_stables_and_etf(logf: str | None = None) -> Dict[str, Any]:
     stables_total = None
+    # DeFiLlama stables total
     try:
         r = requests.get("https://stablecoins.llama.fi/stablecoin/marketcap", timeout=20)
         r.raise_for_status()
         data = r.json()
-        # total mcap - останній елемент агрегованого ряду
         total = 0.0
         for sc in data.get("peggedAssets", []):
             cur = sc.get("circulating", [])
             if cur:
                 last = cur[-1]
-                # last is [ts, cap]
                 if isinstance(last, list) and len(last) >= 2 and isinstance(last[1], (int, float)):
                     total += float(last[1])
         stables_total = total
+        log(f"DeFiLlama stables total parsed: {round(stables_total or 0, 2)}", logfile=logf)
     except Exception as e:
+        log(f"DeFiLlama fetch error: {e}", logfile=logf)
         stables_total = None
 
-    # ETF flows - Farside html, якщо не вийде - SoSoValue
-    etf_rows = []
+    # ETF flows - Farside -> SoSoValue
+    etf_rows: List[Dict[str, Any]] = []
     etf_source = "farside"
     try:
-        fr = requests.get("https://www.farside.co.uk/bitcoin-spot-etf-flows", timeout=20, headers={"User-Agent":"Mozilla/5.0"})
+        fr = requests.get(
+            "https://www.farside.co.uk/bitcoin-spot-etf-flows",
+            timeout=20,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
         fr.raise_for_status()
         soup = BeautifulSoup(fr.text, "lxml")
         table = soup.find("table")
         if not table:
             raise RuntimeError("no table on Farside")
-        # простий парс - до 10 рядків
+        # простий парс - до 50 рядків
         for tr in table.find_all("tr")[1:]:
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) >= 3:
                 etf_rows.append({"date": tds[0], "issuer": tds[1], "flow": tds[2]})
         if not etf_rows:
             raise RuntimeError("empty Farside rows")
-    except Exception:
+        log(f"Farside parsed rows: {len(etf_rows)}", logfile=logf)
+    except Exception as e:
+        log(f"Farside error: {e} - switching to SoSoValue fallback", logfile=logf)
         etf_source = "sosovalue"
         etf_rows = []
         try:
-            sr = requests.get("https://sosovalue.xyz/article/bitcoin-etf-data", timeout=20, headers={"User-Agent":"Mozilla/5.0", "Referer":"https://sosovalue.xyz"})
+            sr = requests.get(
+                "https://sosovalue.xyz/article/bitcoin-etf-data",
+                timeout=20,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://sosovalue.xyz"}
+            )
             sr.raise_for_status()
             soup = BeautifulSoup(sr.text, "lxml")
-            # шукаємо таблицю або рядки даних - легкий DOM-фолбек
             for tr in soup.find_all("tr"):
                 tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if len(tds) >= 3 and any(x.lower().startswith("20") for x in tds):  # дата вигляду YYYY-MM-DD
+                # грубий фільтр на дату у форматі YYYY-MM-DD
+                if len(tds) >= 3 and any(x.lower().startswith("20") for x in tds):
                     etf_rows.append({"date": tds[0], "issuer": tds[1], "flow": tds[2]})
-        except Exception:
+            log(f"SoSoValue parsed rows: {len(etf_rows)}", logfile=logf)
+        except Exception as ee:
+            log(f"SoSoValue error: {ee}", logfile=logf)
             etf_rows = []
 
-    res = {
-        "stables": {
-            "total": stables_total
-        },
-        "etf": {
-            "rows": etf_rows[:50],
-            "source": etf_source
-        }
+    return {
+        "stables": {"total": stables_total},
+        "etf": {"rows": etf_rows[:50], "source": etf_source},
     }
-    return res
+
+
+# ---------- main ----------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -160,63 +209,67 @@ def main():
     args = ap.parse_args()
 
     out_dir = args.out
+    logs_dir = args.logs
     os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
+    post_log = os.path.join(logs_dir, "postprocess.log")
 
     tripack_path = os.path.join(out_dir, 'tripack_meta_v2.json')
     index_path = os.path.join(out_dir, 'index.json')
     run_meta_path = os.path.join(out_dir, 'run_meta.json')
+    vola_path = os.path.join(out_dir, 'options_vola_v2.json')
+    macro_path = os.path.join(out_dir, 'macro_flows_v2.json')
+    derivs_path = os.path.join(out_dir, 'derivs_signals_v2.json')
 
-    # базові файли мають існувати - якщо ні, ініціалізуємо мінімалками
+    # базові файли - ініціалізація мінімалками якщо вони відсутні
     if not ensure_file(index_path):
-        dump_json(index_path, {"files": {"spot": {"files":[]}}, "conf": 0.0})
-        log("index.json created minimal")
+        dump_json(index_path, {"files": {"spot": {"files": []}}, "conf": 0.0})
+        log("index.json created minimal", logfile=post_log)
     if not ensure_file(tripack_path):
-        dump_json(tripack_path, {"log":{"quorum":"fail","missing":[],"flags":[]},"checks":{},"conf":0.0})
-        log("tripack_meta_v2.json created minimal")
+        dump_json(tripack_path, {"log": {"quorum": "fail", "missing": [], "flags": []}, "checks": {}, "conf": 0.0})
+        log("tripack_meta_v2.json created minimal", logfile=post_log)
     if not ensure_file(run_meta_path):
         dump_json(run_meta_path, {"run_id": args.gh_run_id})
-        log("run_meta.json created minimal")
+        log("run_meta.json created minimal", logfile=post_log)
 
+    # завантажуємо поточні
     tripack = load_json(tripack_path)
     indexj = load_json(index_path)
 
-    # 1) options_vola_v2.json - hv surrogate якщо бракує
-    vola_path = os.path.join(out_dir, 'options_vola_v2.json')
+    # ---------- 1) options_vola_v2.json ----------
     if not ensure_file(vola_path):
         try:
-            vola = try_calc_hv_from_spot(out_dir)
+            vola = try_calc_hv_from_spot(out_dir, logf=post_log)
             dump_json(vola_path, vola)
-            # позначки в tripack
             tripack.setdefault("checks", {})["options_vola_ok"] = True
             tripack.setdefault("log", {}).setdefault("flags", []).append("vol:surrogate:hv")
-            log("options_vola_v2.json created via hv_surrogate")
+            log("options_vola_v2.json created via hv_surrogate", logfile=post_log)
         except Exception as e:
             tripack.setdefault("checks", {})["options_vola_ok"] = False
             tripack.setdefault("log", {}).setdefault("missing", []).append("options_vola_v2.json")
             tripack.setdefault("log", {}).setdefault("flags", []).append("vol:missing")
-            log(f"options_vola_v2.json missing - reason: {e}")
+            log(f"options_vola_v2.json missing - reason: {e}", logfile=post_log)
+    else:
+        tripack.setdefault("checks", {})["options_vola_ok"] = True
 
-    # 2) macro_flows_v2.json - DeFiLlama + Farside/SoSoValue
-    macro_path = os.path.join(out_dir, 'macro_flows_v2.json')
+    # ---------- 2) macro_flows_v2.json ----------
     if not ensure_file(macro_path):
-        macro = fetch_stables_and_etf()
-        flags = []
+        macro = fetch_stables_and_etf(logf=post_log)
+        flags: List[str] = []
         ok = True
 
-        st_total = macro.get("stables",{}).get("total")
+        st_total = macro.get("stables", {}).get("total")
         if st_total is None:
             ok = False
             flags.append("macro:stables_missing")
 
-        etf_rows = macro.get("etf",{}).get("rows", [])
-        etf_source = macro.get("etf",{}).get("source", "unknown")
+        etf_rows = macro.get("etf", {}).get("rows", [])
+        etf_source = macro.get("etf", {}).get("source", "unknown")
         if not etf_rows:
             ok = False
             flags.append("macro:etf_missing")
-        else:
-            # якщо джерело sosovalue - штраф прапором, сам conf рахує collector
-            if etf_source == "sosovalue":
-                flags.append("macro:fallback:sosovalue")
+        elif etf_source == "sosovalue":
+            flags.append("macro:fallback:sosovalue")
 
         out_obj = {
             "ok": ok,
@@ -232,32 +285,51 @@ def main():
             tripack.setdefault("checks", {})["macro_quorum"] = False
             tripack.setdefault("log", {}).setdefault("missing", []).append("macro_flows_v2.json")
             tripack.setdefault("log", {}).setdefault("flags", []).extend(flags)
-        log(f"macro_flows_v2.json created - ok={out_obj['ok']} source={etf_source} rows={len(etf_rows)}")
+        log(f"macro_flows_v2.json created - ok={out_obj['ok']} source={etf_source} rows={len(etf_rows)}", logfile=post_log)
+    else:
+        # якщо файл є - виставимо чек приблизно
+        try:
+            mm = load_json(macro_path)
+            st_total = (mm.get("stables") or {}).get("total")
+            etf_rows = (mm.get("etf") or {}).get("rows") or []
+            tripack.setdefault("checks", {})["macro_quorum"] = bool((st_total or 0) > 1e9 and len(etf_rows) > 0)
+        except Exception:
+            tripack.setdefault("checks", {})["macro_quorum"] = False
 
-    # 3) spot sanity - якщо індекс знає про spot частини - позначимо чек
-    spot_files = indexj.get('files', {}).get('spot', {}).get('files', [])
+    # ---------- 3) spot sanity ----------
+    spot_files = indexj.get("files", {}).get("spot", {}).get("files", [])
     if spot_files:
-        # sanity маркер позитивний - точне значення BTC close перевіряє collector
         tripack.setdefault("checks", {})["btc_close_gt_1000"] = True
     else:
         tripack.setdefault("checks", {})["btc_close_gt_1000"] = False
         tripack.setdefault("log", {}).setdefault("missing", []).append("spot_ohlcv_v2_partNNN.json")
         tripack.setdefault("log", {}).setdefault("flags", []).append("spot:missing")
 
-    # 4) derivs presence
-    if not ensure_file(os.path.join(out_dir, 'derivs_signals_v2.json')):
+    # ---------- 4) derivs presence ----------
+    if not ensure_file(derivs_path):
         tripack.setdefault("log", {}).setdefault("missing", []).append("derivs_signals_v2.json")
         tripack.setdefault("log", {}).setdefault("flags", []).append("derivs:missing")
 
-    # 5) фіналізація quorum
-    missing = list(dict.fromkeys(tripack.get("log", {}).get("missing", [])))
-    if not missing:
-        tripack.setdefault("log", {})["quorum"] = "ok" if "macro:fallback:sosovalue" not in tripack.get("log", {}).get("flags", []) else "ok_fallback"
+    # ---------- 5) фінальне quorum ----------
+    # унікалізуємо missing
+    log_block = tripack.setdefault("log", {})
+    log_block["missing"] = list(dict.fromkeys(log_block.get("missing", [])))
+
+    if not log_block["missing"]:
+        # якщо був sosovalue - ok_fallback, інакше ok
+        flags = log_block.get("flags", [])
+        tripack["log"]["quorum"] = "ok_fallback" if "macro:fallback:sosovalue" in flags else "ok"
     else:
-        tripack.setdefault("log", {})["quorum"] = "fail"
+        tripack["log"]["quorum"] = "fail"
 
     dump_json(tripack_path, tripack)
-    log(f"tripack_meta_v2.json updated - quorum={tripack['log']['quorum']} missing={tripack['log'].get('missing',[])} flags={tripack['log'].get('flags',[])}")
+    log(f"tripack_meta_v2.json updated - quorum={tripack['log']['quorum']} missing={tripack['log'].get('missing', [])} flags={tripack['log'].get('flags', [])}", logfile=post_log)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as ex:
+        # фатальна помилка постпроцесу - лог і ненульовий вихід
+        print(f"[POST][FATAL] {ex}", file=sys.stderr)
+        sys.exit(2)
