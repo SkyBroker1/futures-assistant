@@ -1,0 +1,3 @@
+== HEALTH INDEX ==
+{"generated_at":"2025-10-30T09:12:09.981021Z","items":{"files":{"spot":{"files":["spot_ohlcv_v2_part001.json"]},"derivs":{"file":"derivs_signals_v2.json"},"vola":{"file":"options_vola_v2.json"},"macro":{"file":"macro_flows_v2.json"}}},"conf":0.82,"policy_flags":{"leader-lock":"OFF","flow-alignment":"UNC","mHedge":"UNC"}}
+{"conf":0.82,"log":{"quorum":"ok_fallback","missing":[],"flags":["sanity:btc_close_le_1000_or_missing","etf:fallback:sosovalue","vol:surrogate:hv","observability:cloud_dir_render_error"]},"policy_flags":{"leader-lock":"OFF","flow-alignment":"UNC","mHedge":"UNC"}}

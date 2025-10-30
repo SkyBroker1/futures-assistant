@@ -1,0 +1,17 @@
+2025-10-30T09:10:42.698785Z spot:symbols GET fail https://api.binance.com/api/v3/exchangeInfo: HTTP 451 {
+  "code": 0,
+  "msg": "Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you be
+2025-10-30T09:10:58.480473Z spot:okx BTCUSDT 1h okx_empty
+2025-10-30T09:11:06.318160Z spot:okx BTCUSDT 4h okx_empty
+2025-10-30T09:11:14.104578Z spot:okx BTCUSDT 1d okx_empty
+2025-10-30T09:11:29.894690Z spot:okx ETHUSDT 1h okx_empty
+2025-10-30T09:11:37.663321Z spot:okx ETHUSDT 4h okx_empty
+2025-10-30T09:11:45.535171Z spot:okx ETHUSDT 1d okx_empty
+2025-10-30T09:11:53.304563Z derivs:binance GET fail https://fapi.binance.com/fapi/v1/premiumIndex: HTTP 451 {
+  "code": 0,
+  "msg": "Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you be
+2025-10-30T09:11:53.517940Z derivs:okx_funding 1
+2025-10-30T09:12:01.251569Z derivs:bybit GET fail https://api.bybit.com/v5/market/open-interest: HTTP 403 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<HTML><HEAD><META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8
+2025-10-30T09:12:01.888658Z macro:defillama defillama_zero
+2025-10-30T09:12:09.744892Z macro:farside GET fail https://farside.co.uk/bitcoin/: HTTP 403 <!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><meta http-equiv="X-UA-Compatible" content
