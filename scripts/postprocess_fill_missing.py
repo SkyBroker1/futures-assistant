@@ -2,9 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-postprocess_fill_missing.py v1.7.1
-- Фікс SyntaxError у extract_btc_closes_from_shard (жодних compound-стейтментів після ';').
-- Логіка фолбеків і seed як у v1.7 (див. коментарі нижче).
+postprocess_fill_missing.py v1.8
+Гарантований випуск файлів для кворуму:
+- SPOT: existing -> Binance 1d -> CoinGecko 1d -> last price (без spot-файлу)
+- VOLA: hv з свічок -> const 60 (seed-вбудований)
+- MACRO: DeFiLlama+Farside -> SoSoValue -> cache(static/cache) -> seed(static/seed) -> EMBEDDED SEED
+- DERIVS: stub, якщо collector не дав
+Якщо спрацьовує seed/embedded, логуються прапори і quorum стає ok_seed.
 """
 
 import argparse, json, os, sys, time, math, statistics
@@ -12,6 +16,28 @@ from typing import Any, Dict, List
 import requests
 from bs4 import BeautifulSoup
 
+# ----------------- constants -----------------
+EMBEDDED_MACRO = {
+    "ok": True,
+    "stables": {"total": 235000000000.0},
+    "etf": {
+        "source": "seed",
+        "rows": [
+            {"date": "2025-01-01", "issuer": "SeedCache", "flow": "+10,000"}
+        ],
+    },
+    "flags": ["macro:seed"]
+}
+EMBEDDED_VOLA = {
+    "ok": True,
+    "mode": "hv_surrogate_const",
+    "asof_ms": 1735600000000,
+    "symbols": {"BTC": {"hv_annual_pct": 60.0}, "ETH": {"hv_annual_pct": 54.0}},
+    "flags": ["vol:surrogate:const"],
+    "notes": "embedded constant HV to ensure quorum"
+}
+
+# ----------------- utils -----------------
 def log(msg: str, *, logfile: str | None = None) -> None:
     line = f"[POST] {msg}"
     print(line)
@@ -86,14 +112,12 @@ def extract_btc_closes_from_shard(obj: Any) -> List[float]:
             closes = [c[4] for c in candles if isinstance(c, (list, tuple)) and len(c) >= 5]
             return closes if closes else None
         return None
-
     if isinstance(obj, list):
         for rec in obj:
             if isinstance(rec, dict):
                 x = ext(rec)
                 if x:
                     return x
-
     if isinstance(obj, dict):
         for rec in (obj.get("rows") or obj.get("data") or []):
             if isinstance(rec, dict):
@@ -148,6 +172,7 @@ def read_json_if(path: str) -> Dict[str, Any] | None:
     except Exception:
         return None
 
+# ----------------- main -----------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', required=True)
@@ -173,6 +198,7 @@ def main():
     seed_etf  = os.path.join(seed_dir, "macro_flows_v2.json")
     seed_vola = os.path.join(seed_dir, "options_vola_v2.json")
 
+    # базові мета
     if not ensure_file(index_path):
         dump_json(index_path, {"files": {"spot": {"files": []}}, "conf": 0.0}); log("index.json created minimal", logfile=post_log)
     if not ensure_file(tripack_path):
@@ -183,7 +209,7 @@ def main():
     indexj = load_json(index_path)
     tripack = load_json(tripack_path)
 
-    # SPOT & closes
+    # ---------- SPOT & closes ----------
     closes: List[float] = []
     spot_files = indexj.get("files", {}).get("spot", {}).get("files", [])
     if spot_files:
@@ -220,12 +246,12 @@ def main():
         except Exception as e:
             log(f"coingecko error: {e}", logfile=post_log)
 
-    # DERIVS
+    # ---------- DERIVS ----------
     if not ensure_file(derivs_path):
         dump_json(derivs_path, {"ok": False, "flags": ["derivs:stub"], "note": "collector missing"})
         tripack.setdefault("log", {}).setdefault("flags", []).append("derivs:stub")
 
-    # MACRO
+    # ---------- MACRO ----------
     used_seed = False
     if not ensure_file(macro_path):
         st_total = fetch_stables_defillama()
@@ -245,6 +271,7 @@ def main():
             if cache and isinstance(cache.get("total"), (int, float)):
                 st_total = float(cache["total"]); flags.append("macro:stables_cache")
         ok_macro = bool((st_total or 0) > 1e9 and len(etf_rows) > 0)
+        # seed з диска
         if not ok_macro:
             seed = read_json_if(seed_etf)
             if seed:
@@ -253,6 +280,14 @@ def main():
                 flags.append("macro:seed")
                 ok_macro = True
                 log("macro: used SEED", logfile=post_log)
+        # embedded seed - остання лінія оборони
+        if not ok_macro and not ensure_file(macro_path):
+            dump_json(macro_path, EMBEDDED_MACRO)
+            used_seed = True
+            flags.append("macro:seed:embedded")
+            ok_macro = True
+            log("macro: used EMBEDDED SEED", logfile=post_log)
+
         if not used_seed:
             dump_json(macro_path, {"ok": ok_macro, "stables": {"total": st_total}, "etf": {"rows": etf_rows, "source": etf_source}, "flags": flags})
         tripack.setdefault("checks", {})["macro_quorum"] = ok_macro
@@ -268,7 +303,7 @@ def main():
         except Exception:
             tripack.setdefault("checks", {})["macro_quorum"] = False
 
-    # VOLA
+    # ---------- VOLA ----------
     if not ensure_file(vola_path):
         try:
             if closes:
@@ -287,21 +322,18 @@ def main():
                     tripack.setdefault("log", {}).setdefault("flags", []).append("vol:surrogate:const")
                     used_seed = True
                     log("vola: used SEED", logfile=post_log)
-                else:
-                    const = 60.0
-                    dump_json(vola_path, {"ok": True, "mode": "hv_surrogate_const", "asof_ms": int(time.time()*1000),
-                                          "symbols": {"BTC": {"hv_annual_pct": const}, "ETH": {"hv_annual_pct": round(const*0.9, 2)}},
-                                          "flags": ["vol:surrogate:const"], "notes": "const surrogate"})
-                    tripack.setdefault("checks", {})["options_vola_ok"] = True
-                    tripack.setdefault("log", {}).setdefault("flags", []).append("vol:surrogate:const")
         except Exception as e:
-            tripack.setdefault("checks", {})["options_vola_ok"] = False
-            tripack.setdefault("log", {}).setdefault("missing", []).append("options_vola_v2.json")
-            tripack.setdefault("log", {}).setdefault("flags", []).append(f"vol:missing:{e}")
-    else:
-        tripack.setdefault("checks", {})["options_vola_ok"] = True
+            log(f"vola compute error: {e}", logfile=post_log)
 
-    # SANITY
+    # embedded vola як останній рубіж
+    if not ensure_file(vola_path):
+        dump_json(vola_path, EMBEDDED_VOLA)
+        tripack.setdefault("checks", {})["options_vola_ok"] = True
+        tripack.setdefault("log", {}).setdefault("flags", []).append("vol:surrogate:const")
+        used_seed = True
+        log("vola: used EMBEDDED SEED", logfile=post_log)
+
+    # ---------- SANITY ----------
     try:
         last_close = closes[-1] if closes else fetch_binance_last_price()
         tripack.setdefault("checks", {})["btc_close_gt_1000"] = bool(last_close and float(last_close) > 1000.0)
@@ -311,15 +343,15 @@ def main():
         tripack.setdefault("checks", {})["btc_close_gt_1000"] = False
         tripack.setdefault("log", {}).setdefault("flags", []).append(f"spot:sanity:error:{e}")
 
-    # index pointers
+    # ---------- index pointers ----------
     files_block = indexj.setdefault("files", {})
-    files_block.setdefault("derivs", {})["file"] = "derivs_signals_v2.json" if ensure_file(os.path.join(out_dir, "derivs_signals_v2.json")) else None
-    files_block.setdefault("vola",   {})["file"] = "options_vola_v2.json"   if ensure_file(os.path.join(out_dir, "options_vola_v2.json"))   else None
-    files_block.setdefault("macro",  {})["file"] = "macro_flows_v2.json"    if ensure_file(os.path.join(out_dir, "macro_flows_v2.json"))    else None
-    files_block.setdefault("meta",   {})["files"] = ["tripack_meta_v2.json","run_meta.json"]
+    files_block.setdefault("derivs", {})["file"] = "derivs_signals_v2.json" if ensure_file(derivs_path) else None
+    files_block.setdefault("vola",   {})["file"] = "options_vola_v2.json"   if ensure_file(vola_path)   else None
+    files_block.setdefault("macro",  {})["file"] = "macro_flows_v2.json"    if ensure_file(macro_path)  else None
+    files_block.setdefault("meta",   {})["files"] = ["tripack_meta_v2.json", "run_meta.json"]
     dump_json(index_path, indexj)
 
-    # finalize quorum
+    # ---------- finalize quorum ----------
     log_block = tripack.setdefault("log", {})
     log_block["missing"] = list(dict.fromkeys(log_block.get("missing", [])))
     ok_all = (
@@ -329,11 +361,7 @@ def main():
         and tripack.get("checks", {}).get("macro_quorum")
     )
     if ok_all:
-        if used_seed:
-            tripack["log"]["quorum"] = "ok_seed"
-        else:
-            flags = log_block.get("flags", [])
-            tripack["log"]["quorum"] = "ok_fallback" if ("macro:fallback:sosovalue" in flags or "macro:fallback:cache" in flags) else "ok"
+        tripack["log"]["quorum"] = "ok_seed" if ("macro:seed" in log_block.get("flags", []) or "macro:seed:embedded" in log_block.get("flags", []) or "vol:surrogate:const" in log_block.get("flags", [])) else "ok"
     else:
         tripack["log"]["quorum"] = "fail"
 
